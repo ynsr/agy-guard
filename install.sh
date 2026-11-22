@@ -91,6 +91,8 @@ do_install() {
   local dir target
   dir="$(install_dir)"; target="$dir/$LINK_NAME"
   [ -f "$SRC" ] || { log_error "guard not found: $SRC"; exit 1; }
+  HELPER_SRC="$SRC_DIR/agy-accounts"
+  [ -f "$HELPER_SRC" ] || { log_error "accounts helper not found: $HELPER_SRC"; exit 1; }
 
   ALREADY=0
   if [ -L "$target" ]; then
@@ -120,6 +122,7 @@ do_install() {
         log_info "would: copy $SRC -> $target (chmod 755)"
       fi
       [ "$DO_RESTORE" -eq 1 ] && log_info "would: run $LINK_NAME restore (rewrite ~/.local/bin/agy)"
+      log_info "would: install $dir/agy-accounts (accounts helper)"
       return 0
     fi
 
@@ -130,10 +133,29 @@ do_install() {
       local tmp; tmp="$(mktemp -u "$dir/.$LINK_NAME.XXXXXX")"
       ln -s "$SRC" "$tmp"; mv -f "$tmp" "$target"
       log_ok "Linked $target -> $SRC"
+      local htmp; htmp="$(mktemp -u "$dir/.agy-accounts.XXXXXX")"
+      ln -s "$HELPER_SRC" "$htmp"; mv -f "$htmp" "$dir/agy-accounts"
+      log_ok "Linked $dir/agy-accounts -> $HELPER_SRC"
     else
       local tmp; tmp="$(mktemp "$dir/.$LINK_NAME.XXXXXX")"
       cp -f "$SRC" "$tmp"; chmod 755 "$tmp"; mv -f "$tmp" "$target"
       log_ok "Installed $target (copy of $SRC)"
+      local htmp; htmp="$(mktemp "$dir/.agy-accounts.XXXXXX")"
+      cp -f "$HELPER_SRC" "$htmp"; chmod 755 "$htmp"; mv -f "$htmp" "$dir/agy-accounts"
+      log_ok "Installed $dir/agy-accounts (copy of $HELPER_SRC)"
+    fi
+  else
+    # guard already current (ALREADY=1): still lay down a missing helper
+    # (upgrades from pre-accounts installs otherwise never get it)
+    if [ ! -e "$dir/agy-accounts" ]; then
+      local htmp2; htmp2="$(mktemp "$dir/.agy-accounts.XXXXXX")"
+      if [ "$LINK_MODE" -eq 1 ]; then
+        ln -s "$HELPER_SRC" "$htmp2"; mv -f "$htmp2" "$dir/agy-accounts"
+        log_ok "Linked $dir/agy-accounts -> $HELPER_SRC"
+      else
+        cp -f "$HELPER_SRC" "$htmp2"; chmod 755 "$htmp2"; mv -f "$htmp2" "$dir/agy-accounts"
+        log_ok "Installed $dir/agy-accounts (copy of $HELPER_SRC)"
+      fi
     fi
   fi
 
@@ -187,8 +209,8 @@ do_uninstall() {
       exit 1
     fi
     if [ "$DRY_RUN" -eq 1 ]; then log_info "would: remove $target"; return 0; fi
-    rm -f "$target" || { log_error "failed to remove $target"; exit 1; }
-    log_ok "Removed $target"
+    rm -f "$target" "$dir/agy-accounts" || { log_error "failed to remove $target"; exit 1; }
+    log_ok "Removed $target (and agy-accounts helper if present)"
     rm -rf "$HOME/.local/share/$LINK_NAME" && log_ok "Removed install receipt"
   else
     log_info "Not found at $target (nothing to do)"

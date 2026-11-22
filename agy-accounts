@@ -1,0 +1,1024 @@
+#!/usr/bin/env /usr/bin/python3
+"""agy-accounts — multi-account snapshot store for agy-guard (stdlib only).
+
+Secrets live in the Secret Service under agy-guard's own attributes;
+metadata (no secrets) lives in ~/.local/state/agy-guard/accounts.json.
+
+Managed live blobs (the CLI's own credential files):
+  ~/.gemini/oauth_creds.json
+  ~/.gemini/jetski-standalone-oauth-token
+  ~/.gemini/google_accounts.json
+plus the one Secret Service item {service: gemini, username: antigravity}.
+
+Exit codes: 0 ok · 1 runtime · 2 usage · 3 secret-store/proxy precondition ·
+             4 account condition (none ok / exhausted) ·
+             5 rotation halted (disabled account).
+"""
+import argparse
+import base64
+import binascii
+import fcntl
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime, timezone
+
+VERSION = "1.0.0"
+APP = "agy-guard"
+DEFAULT_DWELL_S = 30 * 60
+MAX_SWITCHES_PER_24H = 2
+SWITCH_LOG_MAX = 200
+
+LIVE_FILES = ("oauth_creds.json", "jetski-standalone-oauth-token",
+              "google_accounts.json")
+LIVE_ITEM_ATTRS = {"service": "gemini", "username": "antigravity"}
+# 2 KiB per item keeps every snapshot part well under D-Bus message limits.
+CHUNK = 2048
+
+CLASS_QUOTA = re.compile(
+    r"(RESOURCE_EXHAUSTED|quota|Quota|QUOTA|429|rate.{0,20}(limit|exceed)|"
+    r"quota.{0,20}exceed|exceed.{0,20}quota)", re.S)
+CLASS_AUTH = re.compile(
+    r"(UNAUTHENTICATED|401|invalid.{0,20}grant|token.{0,20}(expired|invalid)|"
+    r"reauth)", re.S | re.I)
+CLASS_DISABLED = re.compile(
+    r"(disabled.{0,60}terms of service|terms of service.{0,60}disabled|"
+    r"account.{0,20}disabled|403.{0,40}disabled)", re.S | re.I)
+
+
+def eprint(*a):
+    print(*a, file=sys.stderr)
+
+
+def utcnow():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def state_dir():
+    return os.environ.get("AGY_GUARD_STATE_DIR",
+                          os.path.join(os.path.expanduser("~"),
+                                       ".local", "state", "agy-guard"))
+
+
+def gemini_dir():
+    return os.environ.get("AGY_GUARD_GEMINI_DIR",
+                          os.path.join(os.path.expanduser("~"), ".gemini"))
+
+
+def lock_path():
+    return os.path.join(state_dir(), "lock")
+
+
+def accounts_path():
+    return os.path.join(state_dir(), "accounts.json")
+
+
+# ---------------------------------------------------------------- state file
+def load_state():
+    p = accounts_path()
+    try:
+        with open(p, encoding="utf-8") as fh:
+            d = json.load(fh)
+    except FileNotFoundError:
+        d = {}
+    except (ValueError, OSError) as e:
+        eprint(f"{APP}: cannot read {p}: {e}")
+        sys.exit(1)
+    d.setdefault("accounts", {})
+    d.setdefault("active", None)
+    d.setdefault("switch_log", [])
+    d.setdefault("halt_rotation", False)
+    d.setdefault("config", {"auto": False, "dwell_seconds": DEFAULT_DWELL_S,
+                            "cooldown_seconds": DEFAULT_DWELL_S})
+    return d
+
+
+def save_state(d):
+    sdir = state_dir()
+    os.makedirs(sdir, mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=sdir, prefix="accounts.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(d, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, accounts_path())
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+class Locked:
+    """Exclusive flock on the guard lock; all state/credential mutation."""
+
+    def __enter__(self):
+        sdir = state_dir()
+        os.makedirs(sdir, mode=0o700, exist_ok=True)
+        self.fh = open(lock_path(), "a+", encoding="utf-8")
+        try:
+            fcntl.flock(self.fh.fileno(), fcntl.LOCK_EX)
+        except OSError as e:
+            eprint(f"{APP}: cannot lock {lock_path()}: {e}")
+            sys.exit(1)
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            fcntl.flock(self.fh.fileno(), fcntl.LOCK_UN)
+        finally:
+            self.fh.close()
+        return False
+
+
+# ---------------------------------------------------------------- secrets
+def _secretstorage():
+    try:
+        import secretstorage  # noqa: PLC0415
+    except ImportError:
+        eprint(f"{APP}: Secret Service unavailable (no secretstorage); "
+               "refusing to handle credentials without the system keyring")
+        sys.exit(3)
+    try:
+        return secretstorage.dbus_init()
+    except Exception as e:  # locked, no session bus, SSH without bus, …
+        eprint(f"{APP}: Secret Service unavailable ({e}); refusing "
+               "plaintext fallback")
+        sys.exit(3)
+
+
+def _writable_collection(bus):
+    """First unlocked collection; refuses (exit 3) when all are locked."""
+    import secretstorage  # noqa: PLC0415
+    try:
+        colls = list(secretstorage.get_all_collections(bus))
+    except Exception as e:
+        eprint(f"{APP}: cannot list keyring collections: {e}")
+        sys.exit(3)
+    for coll in colls:
+        try:
+            if not coll.is_locked():
+                return coll
+        except Exception:  # noqa: BLE001, S110
+            continue
+    eprint(f"{APP}: keyring collection is locked; unlock it and retry")
+    sys.exit(3)
+
+
+def _attrs(account, part):
+    return {"application": APP, "account": account, "part": str(part),
+            "xdg:schema": "org.freedesktop.Secret.Generic"}
+
+
+def secret_write(account, blob):
+    """Store blob bytes as chunked items; replaces any previous snapshot."""
+    bus = _secretstorage()
+    import secretstorage  # noqa: PLC0415
+    secret_delete(account, bus=bus)
+    parts = [blob[i:i + CHUNK] for i in range(0, max(len(blob), 1), CHUNK)]
+    try:
+        coll = _writable_collection(bus)
+        for i, part in enumerate(parts):
+            coll.create_item(
+                f"{APP} account {account} ({i + 1}/{len(parts)})",
+                _attrs(account, i), part, content_type="application/octet-stream")
+    except SystemExit:
+        raise
+    except Exception as e:
+        eprint(f"{APP}: cannot write snapshot for '{account}': {e}")
+        sys.exit(1)
+    return len(parts)
+
+
+def secret_read(account):
+    import secretstorage  # noqa: PLC0415
+    bus = _secretstorage()
+    try:
+        items = sorted(secretstorage.search_items(bus, {"application": APP,
+                                                        "account": account}),
+                       key=lambda it: int(it.get_attributes().get("part", 0)))
+    except Exception as e:
+        eprint(f"{APP}: cannot read snapshot for '{account}': {e}")
+        sys.exit(1)
+    if not items:
+        return None
+    try:
+        return b"".join(it.get_secret() for it in items)
+    except Exception as e:
+        eprint(f"{APP}: keyring item unreadable (locked?) for '{account}': {e}")
+        sys.exit(3)
+
+
+def secret_delete(account, bus=None):
+    import secretstorage  # noqa: PLC0415
+    own = _secretstorage() if bus is None else bus
+    try:
+        for it in secretstorage.search_items(own, {"application": APP,
+                                                   "account": account}):
+            it.delete()
+    except Exception as e:
+        eprint(f"{APP}: cannot delete snapshot for '{account}': {e}")
+        sys.exit(1)
+
+
+def live_secret_read():
+    """The CLI's own keyring item (metadata callers must never print it)."""
+    import secretstorage  # noqa: PLC0415
+    bus = _secretstorage()
+    try:
+        items = list(secretstorage.search_items(bus, dict(LIVE_ITEM_ATTRS)))
+    except Exception as e:
+        eprint(f"{APP}: cannot read live credentials: {e}")
+        sys.exit(1)
+    if not items:
+        return None
+    try:
+        return items[0].get_secret()
+    except Exception as e:
+        eprint(f"{APP}: live keyring item unreadable (locked?): {e}")
+        sys.exit(3)
+
+
+def live_secret_delete():
+    """Delete the CLI's own keyring item (purge only)."""
+    import secretstorage  # noqa: PLC0415
+    bus = _secretstorage()
+    try:
+        for it in secretstorage.search_items(bus, dict(LIVE_ITEM_ATTRS)):
+            it.delete()
+    except Exception as e:
+        eprint(f"{APP}: cannot delete live credentials: {e}")
+        sys.exit(1)
+
+
+def _live_email():
+    """Offline identity of the live login (None if unreadable)."""
+    gdir = gemini_dir()
+    try:
+        with open(os.path.join(gdir, "oauth_creds.json"), "rb") as fh:
+            return email_of_blob(fh.read())
+    except OSError:
+        return None
+
+
+def live_secret_write(blob, content_type="text/plain"):
+    import secretstorage  # noqa: PLC0415
+    bus = _secretstorage()
+    try:
+        coll = _writable_collection(bus)
+        for it in secretstorage.search_items(bus, dict(LIVE_ITEM_ATTRS)):
+            it.delete()
+        coll.create_item(
+            "Password for 'antigravity' on 'gemini'",
+            dict(LIVE_ITEM_ATTRS,
+                 **{"xdg:schema": "org.freedesktop.Secret.Generic"}),
+            blob, content_type=content_type)
+    except SystemExit:
+        raise
+    except Exception as e:
+        eprint(f"{APP}: cannot write live credentials: {e}")
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------- snapshots
+def _b64e(b):
+    return base64.b64encode(b).decode("ascii")
+
+
+def _b64d(s):
+    try:
+        return base64.b64decode(s.encode("ascii"))
+    except (binascii.Error, ValueError) as e:
+        eprint(f"{APP}: snapshot blob is not valid base64: {e}")
+        sys.exit(1)
+
+
+def email_of_blob(raw):
+    """Offline identity: id_token email claim in oauth_creds.json."""
+    try:
+        d = json.loads(raw.decode("utf-8"))
+        tok = d.get("id_token", "")
+        payload = tok.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        return json.loads(base64.urlsafe_b64decode(payload)).get("email")
+    except Exception:
+        return None
+
+
+def capture_live():
+    """Read the live login (files + keyring item) into a snapshot dict."""
+    gdir = gemini_dir()
+    files = {}
+    for name in LIVE_FILES:
+        p = os.path.join(gdir, name)
+        try:
+            with open(p, "rb") as fh:
+                files[name] = _b64e(fh.read())
+        except FileNotFoundError:
+            eprint(f"{APP}: live credential file missing: {p}")
+            sys.exit(1)
+        except OSError as e:
+            eprint(f"{APP}: cannot read {p}: {e}")
+            sys.exit(1)
+    secret = live_secret_read()
+    if secret is None:
+        eprint(f"{APP}: live keyring item "
+              f"{LIVE_ITEM_ATTRS} not found; is anyone logged in?")
+        sys.exit(1)
+    return {"files": files, "live_secret_b64": _b64e(secret),
+            "email": email_of_blob(_b64d(files["oauth_creds.json"]))}
+
+
+def write_live(snap):
+    """Write a snapshot into the live location (files + keyring item)."""
+    gdir = gemini_dir()
+    for name in LIVE_FILES:
+        p = os.path.join(gdir, name)
+        raw = _b64d(snap["files"][name])
+        fd, tmp = tempfile.mkstemp(dir=gdir, prefix=name + ".",
+                                   suffix=".tmp")
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(raw)
+                fh.flush()
+                os.fsync(fh.fileno())
+            try:
+                st = os.stat(p)
+                os.chmod(tmp, st.st_mode & 0o777)
+            except OSError:
+                os.chmod(tmp, 0o600)
+            os.replace(tmp, p)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    live_secret_write(_b64d(snap["live_secret_b64"]))
+
+
+def redact_email(email):
+    if not email or "@" not in email:
+        return email
+    local, dom = email.split("@", 1)
+    return local[:1] + "***@" + dom
+
+
+# ---------------------------------------------------------------- classifier
+def classify(text, rc):
+    if CLASS_DISABLED.search(text or ""):
+        return "disabled_403"
+    if CLASS_QUOTA.search(text or ""):
+        return "quota"
+    if CLASS_AUTH.search(text or "") or rc == 401:
+        return "auth_401"
+    if re.search(r"\b403\b", text or ""):
+        return "disabled_403"
+    return "unknown"
+
+
+# ---------------------------------------------------------------- commands
+def out_json(obj, use_json):
+    if use_json:
+        print(json.dumps(obj))
+    return 0
+
+
+def cmd_list(args):
+    d = load_state()
+    rows = []
+    for name in sorted(d["accounts"]):
+        a = d["accounts"][name]
+        rows.append({"name": name, "email": a.get("email"),
+                     "state": a.get("state", "unknown"),
+                     "reset_hint": a.get("reset_hint"),
+                     "last_used": a.get("last_used"),
+                     "active": name == d.get("active")})
+    if args.json:
+        print(json.dumps({"accounts": rows, "active": d.get("active"),
+                          "halt_rotation": d.get("halt_rotation")}))
+    elif not args.quiet:
+        if not rows:
+            print("no accounts registered (use: accounts add <name>)")
+        for r in rows:
+            mark = "*" if r["active"] else " "
+            print(f"{mark} {r['name']:<16} {r['state']:<12} "
+                  f"{redact_email(r['email']) or '-':<24} "
+                  f"reset={r['reset_hint'] or '-'}")
+    return 0
+
+
+def cmd_current(args):
+    d = load_state()
+    if args.json:
+        print(json.dumps({"active": d.get("active")}))
+    elif not args.quiet:
+        print(d.get("active") or "none")
+    return 0
+
+
+def cmd_add(args):
+    with Locked():
+        d = load_state()
+        if args.name in d["accounts"]:
+            eprint(f"{APP}: account '{args.name}' already exists")
+            return 2
+        snap = capture_live()
+        blob = json.dumps(snap, sort_keys=True).encode()
+        nparts = secret_write(args.name, blob)
+        now = utcnow()
+        d["accounts"][args.name] = {"email": snap["email"], "state": "ok",
+                                    "exhausted_at": None, "reset_hint": None,
+                                    "last_used": now,
+                                    "snapshot_parts": nparts,
+                                    "snapshot_updated_at": now}
+        if d.get("active") is None:
+            d["active"] = args.name
+        save_state(d)
+    if not args.quiet:
+        eprint(f"{APP}: registered '{args.name}' "
+               f"({redact_email(snap['email'])}) from the live login")
+    return 0
+
+
+def cmd_capture(args):
+    with Locked():
+        d = load_state()
+        name = d.get("active")
+        if not name or name not in d["accounts"]:
+            eprint(f"{APP}: no active account to capture into")
+            return 1
+        snap = capture_live()
+        blob = json.dumps(snap, sort_keys=True).encode()
+        nparts = secret_write(name, blob)
+        now = utcnow()
+        d["accounts"][name].update(
+            {"email": snap["email"], "snapshot_parts": nparts,
+             "snapshot_updated_at": now, "last_used": now})
+        save_state(d)
+    if not args.quiet:
+        eprint(f"{APP}: re-snapshotted the live login into '{name}'")
+    return 0
+
+
+def _agy_running():
+    try:
+        r = subprocess.run(["pgrep", "-af",
+                              r"(antigravity-cli/agy|local/bin/agy)( |$)"],
+                           capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    own = {os.getpid(), os.getppid()}  # helper runs as the launcher's child
+    pids = []
+    for line in (r.stdout or "").splitlines():
+        if "agy-accounts" in line or "agy-guard" in line:
+            continue
+        m = re.match(r"\s*(\d+)\s", line)
+        if not m or int(m.group(1)) in own:
+            continue
+        pids.append(line.strip())
+    return pids
+
+
+def _pick_next(d, now_ts):
+    for name in sorted(d["accounts"]):
+        a = d["accounts"][name]
+        if a.get("state") == "ok":
+            return name
+        hint = a.get("reset_hint")
+        if a.get("state") == "exhausted" and hint:
+            try:
+                if now_ts >= datetime.fromisoformat(
+                        hint.replace("Z", "+00:00")).timestamp():
+                    return name
+            except ValueError:
+                continue
+    return None
+
+
+def do_switch(d, target, force=False):
+    """Section 5 algorithm. d is the loaded state; saves on success."""
+    now_ts = time.time()
+    now = utcnow()
+    cfg = d.get("config", {})
+    dwell = cfg.get("dwell_seconds", DEFAULT_DWELL_S)
+    if target not in d["accounts"]:
+        return 2, f"unknown account '{target}'"
+    if d.get("halt_rotation"):
+        return 5, ("rotation is halted (a disabled account exists); clear "
+                   "with: accounts mark <name> ok --ack")
+    if d["accounts"][target].get("state") == "disabled":
+        return 1, f"account '{target}' is disabled; refusing to switch"
+    running = _agy_running()
+    if running:
+        return 1, ("refusing to switch while agy is running:\n  " +
+                   "\n  ".join(running))
+    # live identity must match recorded active; never guess
+    try:
+        with open(os.path.join(gemini_dir(), "oauth_creds.json"), "rb") as fh:
+            live_email = email_of_blob(fh.read())
+    except OSError as e:
+        return 1, f"cannot read live credentials: {e}"
+    active = d.get("active")
+    if active is not None:
+        rec = (d["accounts"].get(active) or {}).get("email")
+        if live_email != rec:
+            return 1, (f"live login ({redact_email(live_email)}) does not "
+                       f"match recorded active '{active}' "
+                       f"({redact_email(rec)}); refusing to guess — run "
+                       "accounts capture or verify first")
+    if active == target:
+        return 0, f"already on '{target}'"
+    last = None
+    try:
+        last = datetime.fromisoformat(
+            (d.get("last_switch") or "1970-01-01T00:00:00Z").replace(
+                "Z", "+00:00")).timestamp()
+    except ValueError:
+        last = 0
+    if not force and now_ts - last < dwell:
+        wait = int(dwell - (now_ts - last))
+        return 1, (f"minimum dwell time not met; wait {wait // 60}m "
+                   f"{wait % 60}s or pass --force")
+    if active is not None and active in d["accounts"]:
+        snap = capture_live()
+        blob = json.dumps(snap, sort_keys=True).encode()
+        nparts = secret_write(active, blob)
+        d["accounts"][active].update(
+            {"email": snap["email"], "snapshot_parts": nparts,
+             "snapshot_updated_at": now, "last_used": now})
+    rollback = capture_live()
+    incoming_raw = secret_read(target)
+    if incoming_raw is None:
+        return 1, f"no snapshot stored for '{target}'"
+    incoming = json.loads(incoming_raw.decode("utf-8"))
+    try:
+        write_live(incoming)
+    except Exception as e:  # noqa: BLE001 — rollback must catch everything
+        try:
+            write_live(rollback)
+        except Exception as e2:  # noqa: BLE001
+            return 1, (f"switch failed ({e}) AND rollback failed ({e2}); "
+                       "restore from backup immediately")
+        return 1, f"switch failed ({e}); live login restored"
+    # verify identity matches the target
+    try:
+        with open(os.path.join(gemini_dir(), "oauth_creds.json"), "rb") as fh:
+            after = email_of_blob(fh.read())
+    except OSError as e:
+        try:
+            write_live(rollback)
+        except Exception:  # noqa: BLE001, S110
+            pass
+        return 1, f"verification read failed ({e}); live login restored"
+    if after != d["accounts"][target].get("email"):
+        try:
+            write_live(rollback)
+        except Exception:  # noqa: BLE001, S110
+            pass
+        return 1, (f"identity mismatch after switch "
+                   f"({redact_email(after)}); live login restored")
+    d["active"] = target
+    d["last_switch"] = now
+    d["accounts"][target]["last_used"] = now
+    log = d.setdefault("switch_log", [])
+    log.append({"ts": now, "from": active, "to": target})
+    del log[:-SWITCH_LOG_MAX]
+    save_state(d)
+    return 0, f"switched {active} -> {target}"
+
+
+def cmd_use(args):
+    with Locked():
+        d = load_state()
+        target = args.name
+        if target == "next":
+            picked = _pick_next(d, time.time())
+            if picked is None:
+                if args.json:
+                    print(json.dumps({"error": "no account ok"}))
+                else:
+                    eprint(f"{APP}: no account with state ok "
+                           "(and no passed reset hint)")
+                return 4
+            target = picked
+        rc, msg = do_switch(d, target, force=args.force)
+    if args.json:
+        print(json.dumps({"active": d.get("active") if rc == 0 else None,
+                          "message": msg}))
+    elif not args.quiet:
+        eprint(f"{APP}: {msg}")
+    return rc
+
+
+def cmd_mark(args):
+    with Locked():
+        d = load_state()
+        if args.name not in d["accounts"]:
+            eprint(f"{APP}: unknown account '{args.name}'")
+            return 2
+        if args.state not in ("ok", "exhausted", "disabled"):
+            eprint(f"{APP}: state must be ok|exhausted|disabled")
+            return 2
+        a = d["accounts"][args.name]
+        a["state"] = args.state
+        if args.state == "exhausted":
+            a["exhausted_at"] = utcnow()
+            a["reset_hint"] = args.until
+        elif args.state == "disabled":
+            a["reset_hint"] = args.until
+            d["halt_rotation"] = True
+        else:
+            a["exhausted_at"] = None
+            a["reset_hint"] = args.until
+            if args.ack:
+                d["halt_rotation"] = False
+            elif d.get("halt_rotation"):
+                eprint(f"{APP}: rotation still halted; pass --ack with "
+                       "'mark <name> ok' to clear it")
+        save_state(d)
+    if not args.quiet:
+        eprint(f"{APP}: '{args.name}' marked {args.state}")
+    return 0
+
+
+def cmd_remove(args):
+    with Locked():
+        d = load_state()
+        if args.name not in d["accounts"]:
+            eprint(f"{APP}: unknown account '{args.name}'")
+            return 2
+        if d.get("active") == args.name:
+            eprint(f"{APP}: cannot remove the active account; "
+                   "switch away first")
+            return 1
+        if args.dry_run:
+            if not args.quiet:
+                eprint(f"{APP}: would remove '{args.name}' "
+                       f"({d['accounts'][args.name].get('snapshot_parts', 0)} "
+                       "snapshot parts" +
+                       (" and purge the live login" if args.purge else "") +
+                       ")")
+            return 0
+        removed_email = d["accounts"][args.name].get("email")
+        if args.purge:
+            live_email = _live_email()
+            if live_email is None:
+                eprint(f"{APP}: cannot purge: live login unreadable; "
+                       "refusing to half-wipe")
+                return 1
+            if live_email != removed_email:
+                eprint(f"{APP}: cannot purge '{args.name}': the live login "
+                       f"is {redact_email(live_email)}; refusing to delete "
+                       "another account's live files")
+                return 1
+            for name in LIVE_FILES:
+                try:
+                    os.unlink(os.path.join(gemini_dir(), name))
+                except OSError:
+                    pass
+            live_secret_delete()
+        secret_delete(args.name)
+        del d["accounts"][args.name]
+        save_state(d)
+    if not args.quiet:
+        eprint(f"{APP}: removed '{args.name}'")
+    return 0
+
+
+def cmd_verify(args):
+    problems = []
+    sdir = state_dir()
+    try:
+        st = os.stat(sdir)
+        if st.st_mode & 0o777 & 0o027:
+            problems.append(f"{sdir} permissions are too open "
+                            f"({oct(st.st_mode & 0o777)})")
+    except FileNotFoundError:
+        problems.append(f"{sdir} does not exist (no accounts registered yet)")
+    try:
+        st = os.stat(accounts_path())
+        if st.st_mode & 0o777 & 0o077:
+            problems.append(f"{accounts_path()} permissions are too open")
+    except FileNotFoundError:
+        pass
+    d = load_state()
+    for name, a in d["accounts"].items():
+        raw = secret_read(name)
+        if raw is None:
+            problems.append(f"'{name}': snapshot missing from keyring")
+            continue
+        try:
+            snap = json.loads(raw.decode("utf-8"))
+            missing = [f for f in LIVE_FILES if f not in snap.get("files", {})]
+            if missing or "live_secret_b64" not in snap:
+                problems.append(f"'{name}': snapshot incomplete "
+                                f"(missing {missing})")
+            elif snap.get("email") != a.get("email"):
+                problems.append(f"'{name}': snapshot email "
+                                f"({redact_email(snap.get('email'))}) != "
+                                f"recorded ({redact_email(a.get('email'))})")
+        except (ValueError, KeyError) as e:
+            problems.append(f"'{name}': snapshot undecodable: {e}")
+    # proxy: TCP-reachable check only (no egress probe — verify is offline)
+    proxy = os.environ.get("ANTIGRAVITY_PROXY", "http://127.0.0.1:10808")
+    m = re.match(r"https?://([^/:]+):(\d+)", proxy)
+    if not m:
+        problems.append(f"proxy URL is not http(s): {proxy}")
+    else:
+        import socket  # noqa: PLC0415
+        try:
+            with socket.create_connection((m.group(1), int(m.group(2))),
+                                         timeout=4):
+                pass
+        except OSError:
+            problems.append(f"proxy {m.group(1)}:{m.group(2)} not reachable")
+    if args.json:
+        print(json.dumps({"status": "ok" if not problems else "stale",
+                          "problems": problems,
+                          "active": d.get("active")}))
+    elif not args.quiet:
+        if problems:
+            for p in problems:
+                eprint(f"{APP}: {p}")
+        else:
+            eprint(f"{APP}: snapshots, identity, perms and proxy reachable")
+    return 0 if not problems else 1
+
+
+def _print_backup_info(path):
+    try:
+        st = os.stat(path)
+        eprint(f"{APP}: wrote {st.st_size} bytes to {path} "
+               f"(mode {oct(st.st_mode & 0o777)})")
+    except OSError:
+        pass
+
+
+def cmd_backup(args):
+    with Locked():
+        d = load_state()
+        bundle = {"meta": {k: v for k, v in d.items()},
+                  "snapshots": {}}
+        for name in d["accounts"]:
+            raw = secret_read(name)
+            if raw is None:
+                eprint(f"{APP}: snapshot missing for '{name}'; aborting")
+                return 1
+            bundle["snapshots"][name] = _b64e(raw)
+        payload = json.dumps(bundle, sort_keys=True).encode()
+        if args.dry_run:
+            if not args.quiet:
+                eprint(f"{APP}: would back up {len(d['accounts'])} "
+                       f"account(s), {len(payload)} bytes -> {args.out}")
+            return 0
+        fd, tmp = tempfile.mkstemp(prefix="agy-accounts-backup.",
+                                   suffix=".tmp",
+                                   dir=os.path.dirname(
+                                       os.path.abspath(args.out)) or ".")
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(payload)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, args.out)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    if not args.quiet:
+        _print_backup_info(args.out)
+        eprint(f"{APP}: NOTE: this file holds credentials — move it to "
+               "age/gpg-encrypted storage (mode 0600 stays on the file)")
+    return 0
+
+
+def cmd_restore(args):
+    try:
+        with open(args.in_file, "rb") as fh:
+            bundle = json.loads(fh.read().decode("utf-8"))
+    except (OSError, ValueError) as e:
+        eprint(f"{APP}: cannot read backup {args.in_file}: {e}")
+        return 1
+    names = sorted(bundle.get("snapshots", {}))
+    if args.dry_run:
+        if not args.quiet:
+            eprint(f"{APP}: would restore {len(names)} account(s): "
+                   f"{', '.join(names) or '(none)'}")
+        return 0
+    with Locked():
+        d = load_state()
+        for name, b64 in bundle.get("snapshots", {}).items():
+            raw = _b64d(b64)
+            snap = json.loads(raw.decode("utf-8"))
+            secret_write(name, raw)
+            d["accounts"][name] = {
+                "email": snap.get("email"), "state": "ok",
+                "exhausted_at": None, "reset_hint": None,
+                "last_used": utcnow(),
+                "snapshot_parts": len(raw) // CHUNK + 1,
+                "snapshot_updated_at": utcnow()}
+        if d.get("active") not in d["accounts"] and names:
+            d["active"] = names[0]
+        save_state(d)
+    if not args.quiet:
+        eprint(f"{APP}: restored {len(names)} account(s)")
+    return 0
+
+
+def cmd_classify(args):
+    text = args.text or sys.stdin.read()
+    cls = classify(text, args.code or 0)
+    if args.json:
+        print(json.dumps({"class": cls}))
+    elif not args.quiet:
+        print(cls)
+    if cls == "quota":
+        return 4
+    if cls == "disabled_403":
+        return 5
+    return 0
+
+
+def cmd_launch_decide(args):
+    """Assisted/auto pre-launch check. Prints the decision as JSON."""
+    d = load_state()
+    active = d.get("active")
+    a = (d["accounts"].get(active) or {}) if active else {}
+    now_ts = time.time()
+    # exhausted with no hint means unknown reset: assist anyway (treated
+    # as far-future); only a passed timestamp lets us auto-recover
+    exhausted_future = (
+        a.get("state") == "exhausted" and
+        (not a.get("reset_hint") or
+         _hint_in_future(a.get("reset_hint"), now_ts)))
+    decision = {"action": "proceed", "active": active,
+                "reason": "account ok or no accounts configured"}
+    if d.get("halt_rotation"):
+        decision = {"action": "halt", "active": active,
+                    "reason": "rotation halted (disabled account); "
+                              "clear with: accounts mark <name> ok --ack",
+                    "exit": 5}
+    elif exhausted_future:
+        alt = _pick_next(d, now_ts)
+        until = a.get("reset_hint") or "an unknown time"
+        if alt is None:
+            decision = {"action": "halt", "active": active,
+                        "reason": f"'{active}' exhausted until {until} "
+                                  "and no account ok",
+                        "exit": 4}
+        elif args.auto and _auto_allowed(d, now_ts):
+            decision = {"action": "switch", "active": active, "target": alt,
+                        "reason": f"'{active}' exhausted until {until}; "
+                                  f"auto-switch to '{alt}'"}
+        else:
+            decision = {"action": "ask", "active": active, "target": alt,
+                        "reason": f"'{active}' exhausted until {until}; "
+                                  f"'{alt}' is ok"}
+    print(json.dumps(decision))
+    return 0
+
+
+def _hint_in_future(hint, now_ts):
+    try:
+        return now_ts < datetime.fromisoformat(
+            hint.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return False
+
+
+def _auto_allowed(d, now_ts):
+    cfg = d.get("config", {})
+    if not cfg.get("auto"):
+        return False
+    try:
+        last = datetime.fromisoformat(
+            (d.get("last_switch") or "1970-01-01T00:00:00Z").replace(
+                "Z", "+00:00")).timestamp()
+    except ValueError:
+        last = 0
+    if now_ts - last < cfg.get("dwell_seconds", DEFAULT_DWELL_S):
+        return False
+    day_ago = now_ts - 24 * 3600
+    recent = sum(1 for e in d.get("switch_log", [])
+                 if _ts(e.get("ts", "")) >= day_ago)
+    return recent < MAX_SWITCHES_PER_24H
+
+
+def _ts(s):
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0
+
+
+def cmd_quota_hit(args):
+    """Mark the active account exhausted after a classified quota error."""
+    with Locked():
+        d = load_state()
+        active = d.get("active")
+        if not active or active not in d["accounts"]:
+            eprint(f"{APP}: no active account to mark")
+            return 1
+        a = d["accounts"][active]
+        a["state"] = "exhausted"
+        a["exhausted_at"] = utcnow()
+        if args.reset_hint:
+            a["reset_hint"] = args.reset_hint
+        save_state(d)
+    return 0
+
+
+def cmd_disabled_hit(args):
+    with Locked():
+        d = load_state()
+        active = d.get("active")
+        if not active or active not in d["accounts"]:
+            eprint(f"{APP}: no active account to mark")
+            return 1
+        d["accounts"][active]["state"] = "disabled"
+        d["halt_rotation"] = True
+        save_state(d)
+    return 0
+
+
+def cmd_prompt(_args):
+    d = load_state()
+    print(d.get("active") or "")
+    return 0
+
+
+# ---------------------------------------------------------------- main
+def build_parser():
+    p = argparse.ArgumentParser(prog="agy-guard accounts",
+                                description="multi-account snapshots for agy")
+    p.add_argument("--quiet", "-q", action="store_true")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--force", action="store_true")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    for name in ("list", "current", "add", "capture", "use", "mark",
+                 "remove", "verify", "backup", "restore", "classify",
+                 "launch-decide", "quota-hit", "disabled-hit", "prompt"):
+        s = sub.add_parser(name)
+        s.add_argument("--quiet", "-q", action="store_true")
+        s.add_argument("--json", action="store_true")
+        s.add_argument("--dry-run", action="store_true")
+        s.add_argument("--force", action="store_true")
+    sub._name_parser_map["list"]
+    sub._name_parser_map["add"].add_argument("name")
+    sub._name_parser_map["use"].add_argument("name")
+    m = sub._name_parser_map["mark"]
+    m.add_argument("name")
+    m.add_argument("state")
+    m.add_argument("--until", default=None)
+    m.add_argument("--ack", action="store_true")
+    r = sub._name_parser_map["remove"]
+    r.add_argument("name")
+    r.add_argument("--purge", action="store_true")
+    sub._name_parser_map["backup"].add_argument("--out", required=True)
+    sub._name_parser_map["restore"].add_argument("in_file", metavar="FILE")
+    c = sub._name_parser_map["classify"]
+    c.add_argument("--text", default=None)
+    c.add_argument("--code", type=int, default=0)
+    sub._name_parser_map["launch-decide"].add_argument("--auto",
+                                                       action="store_true")
+    sub._name_parser_map["quota-hit"].add_argument("--reset-hint", default=None)
+    return p
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    with_dry = {"remove", "backup", "restore"}
+    if args.dry_run and args.cmd not in with_dry:
+        eprint(f"{APP}: --dry-run only applies to remove/backup/restore")
+        return 2
+    cmds = {
+        "list": cmd_list, "current": cmd_current, "add": cmd_add,
+        "capture": cmd_capture, "use": cmd_use, "mark": cmd_mark,
+        "remove": cmd_remove, "verify": cmd_verify, "backup": cmd_backup,
+        "restore": cmd_restore, "classify": cmd_classify,
+        "launch-decide": cmd_launch_decide, "quota-hit": cmd_quota_hit,
+        "disabled-hit": cmd_disabled_hit, "prompt": cmd_prompt,
+    }
+    try:
+        return cmds[args.cmd](args)
+    except BrokenPipeError:
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

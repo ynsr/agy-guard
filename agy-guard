@@ -28,19 +28,32 @@
 #                                     --log-file F   JSONL of each connection
 #                                     --summary F    JSON summary (default: <log>.summary.json)
 #                                     --upstream URL real proxy to forward to
+#   agy-guard accounts <cmd> [opts] multi-account snapshots (see below)
+#                                     list [--json] · current [--json] ·
+#                                     add <name> · capture · use <name|next> [--force] ·
+#                                     mark <name> ok|exhausted|disabled [--until ISO8601] [--ack] ·
+#                                     remove <name> [--purge] [--dry-run] ·
+#                                     verify [--json] · backup --out FILE [--dry-run] ·
+#                                     restore FILE [--dry-run] · prompt
 #   agy-guard --guard-help | --gh   this help
 #   agy-guard --guard-version       guard version (--version is the CLI's)
 #   agy-guard -- <args>             force pass-through for a management name
 #   agy-guard <any other args>      identical to `agy <args>` (proxied, checked)
 #
 # Options: --quiet/-q (no human output, exit code only), --json (machine
-#          readable verify/status/doctor result), --dry-run (restore).
+#          readable result), --dry-run (restore/remove/backup), --force (use).
+#          `--` forces CLI pass-through if the CLI ever gains an `accounts`
+#          subcommand of its own.
 #
 # Environment: ANTIGRAVITY_PROXY (default http://127.0.0.1:10808),
-# ANTIGRAVITY_CLI_BIN (real CLI path), AGY_GUARD_PROBE_URL (probe endpoint).
+# ANTIGRAVITY_CLI_BIN (real CLI path), AGY_GUARD_PROBE_URL (probe endpoint),
+# AGY_GUARD_STATE_DIR (default ~/.local/state/agy-guard),
+# AGY_GUARD_GEMINI_DIR (default ~/.gemini).
 #
 # Exit codes: 0 success · 1 runtime error · 2 usage error · 3 proxy/precondition
-#             failure (refused to run without a working tunnel).
+#             failure (refused to run without a working tunnel) ·
+#             4 account condition (quota-exhausted, nothing to switch to) ·
+#             5 account disabled (rotation halted).
 set -u
 
 GUARD_VERSION="1.1.0"
@@ -49,6 +62,7 @@ SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 INSTALLED="$HOME/.local/bin/agy"
 RC_FILES="$HOME/.bashrc $HOME/.zshrc $HOME/.bash_profile $HOME/.profile"
 REAL="${ANTIGRAVITY_CLI_BIN:-$HOME/.local/share/antigravity-cli/agy}"
+ACCOUNTS_HELPER="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/agy-accounts"
 PROXY="${ANTIGRAVITY_PROXY:-http://127.0.0.1:10808}"
 PROBE_URL="${AGY_GUARD_PROBE_URL:-https://www.google.com/generate_204}"
 BYPASS="localhost,127.0.0.1,::1"
@@ -209,7 +223,13 @@ do_verify() {
 # be an http(s) URL, listening, and able to reach Google. Exits 2 (usage) or 3
 # (precondition) on failure — never returns non-zero.
 assert_proxy_ok() {
-  local p="$1" hostport ph pp code attempt
+  local p="$1" hostport ph pp code attempt probe="$PROBE_URL"
+  # A probe URL that IS the proxy URL can never succeed (the proxy answers
+  # plain HTTP, not a Google 2xx) and would fail every run closed. Fall back
+  # to the default Google probe instead of refusing a healthy tunnel.
+  case "$probe" in
+    "$p"|"$p"/*) probe="https://www.google.com/generate_204" ;;
+  esac
   case "$p" in
     http://*|https://*) ;;
     *) die_usage "proxy must be an http(s) proxy URL, got: $p" ;;
@@ -225,7 +245,7 @@ assert_proxy_ok() {
 
   code=""
   for attempt in 1 2; do
-    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 -x "$p" "$PROBE_URL" 2>/dev/null)
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 -x "$p" "$probe" 2>/dev/null)
     case "${code:-000}" in
       2*|3*) break ;;
       *) code="${code:-000}" ;;
@@ -593,7 +613,7 @@ if [ "$NAME" = "agy-guard" ]; then
   done
   cmd="${1:-}"
   case "$cmd" in
-    restore|verify|status|doctor|trace|--guard-help|--gh|guard-help|--guard-version|--gv|guard-version|--)
+    restore|verify|status|doctor|trace|accounts|--guard-help|--gh|guard-help|--guard-version|--gv|guard-version|--)
       shift || true
       ;;
   esac
@@ -612,20 +632,88 @@ if [ "$NAME" = "agy-guard" ]; then
       [ $# -gt 0 ] && { err "unknown option for '$cmd': $1"; err "try: $NAME --guard-help"; exit 2; }
       ;;
   esac
+  do_accounts() {
+    [ -x "$ACCOUNTS_HELPER" ] || { err "accounts helper not found or not executable: $ACCOUNTS_HELPER"; exit 1; }
+    case "${1:-}" in
+      # offline: read local keyring/state only, no egress involved
+      prompt|list|current|mark|remove|verify|backup|restore) : ;;
+      *) assert_proxy_ok "$PROXY" ;;
+    esac
+    export AGY_GUARD_STATE_DIR AGY_GUARD_GEMINI_DIR
+    if [ "$QUIET" -eq 1 ]; then set -- --quiet "$@"; fi
+    if [ "$JSON" -eq 1 ]; then set -- --json "$@"; fi
+    if [ "$DRY_RUN" -eq 1 ]; then set -- --dry-run "$@"; fi
+    if ! command -v /usr/bin/python3 >/dev/null 2>&1; then
+      err "accounts needs /usr/bin/python3 (secretstorage)"; exit 1
+    fi
+    "/usr/bin/python3" "$ACCOUNTS_HELPER" "$@"; exit $?
+  }
   case "$cmd" in
     restore) do_restore; exit 0 ;;
     verify|doctor) do_verify verify; exit $? ;;
     status) do_verify status; exit $? ;;
     trace) do_trace "$@"; exit $? ;;
+    accounts) do_accounts "$@"; exit $? ;;
     --guard-help|--gh|guard-help) usage; exit 0 ;;
     --guard-version|--gv|guard-version) printf 'agy-guard %s\n' "$GUARD_VERSION"; exit 0 ;;
     --) : ;;  # explicit pass-through
   esac
 fi
 
+# ------------------------------------------------- assisted/auto launch
+# Runs BEFORE exec. Asks the helper whether the active account is exhausted;
+# TTY + healthy alternative -> prompt once (default No); --i-understand-tos-risk
+# + configured auto -> the helper switches; headless/acp -> exit 4, never auto.
+maybe_account_assist() {
+  [ -x "$ACCOUNTS_HELPER" ] || return 0
+  command -v /usr/bin/python3 >/dev/null 2>&1 || return 0
+  local decision action target reason
+  decision=$("/usr/bin/python3" "$ACCOUNTS_HELPER" launch-decide "$AUTO_TOS_FLAG" 2>/dev/null) || return 0
+  action=$(printf '%s' "$decision" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("action","proceed"))' 2>/dev/null) || return 0
+  [ "$action" = "proceed" ] && return 0
+  target=$(printf '%s' "$decision" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("target",""))' 2>/dev/null)
+  reason=$(printf '%s' "$decision" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("reason",""))' 2>/dev/null)
+  if [ "$action" = "halt" ]; then
+    err "agy-guard: $reason"
+    halt_rc=$(printf '%s' "$decision" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("exit",4))' 2>/dev/null)
+    exit "${halt_rc:-4}"
+  fi
+  if [ "$action" = "switch" ]; then
+    # auto mode already vetted by the helper (dwell, 2/day, ok-state, no halt)
+    "/usr/bin/python3" "$ACCOUNTS_HELPER" --force use "$target" >&2 || exit 4
+    say "agy-guard: auto-switched to '$target' ($reason)" >&2
+    return 0
+  fi
+  # ask: TTY only, default No, never in acp/headless
+  case "$*" in
+    *acp*) err "agy-guard: $reason — not switching in acp mode"; exit 4 ;;
+  esac
+  if [ ! -t 0 ] || [ ! -t 1 ]; then
+    err "agy-guard: $reason — not switching without a TTY"
+    exit 4
+  fi
+  printf 'agy-guard: %s\nSwitch to %s? [y/N] ' "$reason" "$target" >&2
+  read -r answer < /dev/tty || { err "agy-guard: no answer — staying put"; exit 4; }
+  case "$answer" in
+    [Yy]|[Yy][Ee][Ss])
+      "/usr/bin/python3" "$ACCOUNTS_HELPER" use "$target" >&2 || exit $?
+      ;;
+    *) err "agy-guard: staying on the exhausted account — the CLI will likely fail"; exit 4 ;;
+  esac
+}
+
 # ---------------------------------------------------------------- launcher
 [ -x "$REAL" ] || { err "CLI binary not found or not executable: $REAL"; exit 1; }
 assert_proxy_ok "$PROXY"
+
+# assisted mode: exhausted active + healthy alternative -> prompt / auto / halt
+AUTO_TOS_FLAG=""
+for _a in "$@"; do
+  case "$_a" in
+    --i-understand-tos-risk) AUTO_TOS_FLAG="--auto" ;;
+  esac
+done
+maybe_account_assist "$@"
 
 # 3) hand the proxied environment to the CLI and everything it spawns
 export HTTP_PROXY="$PROXY"  http_proxy="$PROXY"
@@ -633,4 +721,30 @@ export HTTPS_PROXY="$PROXY" https_proxy="$PROXY"
 export ALL_PROXY="$PROXY"   all_proxy="$PROXY"
 export NO_PROXY="$BYPASS"   no_proxy="$BYPASS"
 
-exec "$REAL" "$@"
+# run the CLI with both streams flowing live (tee duplicates, never
+# swallows) while copies land in a temp file for error classification.
+tmp_out="$(mktemp "${TMPDIR:-/tmp}/agy-guard-out.XXXXXX")"
+tmp_err="$(mktemp "${TMPDIR:-/tmp}/agy-guard-err.XXXXXX")"
+trap 'rm -f "$tmp_out" "$tmp_err"' EXIT INT TERM
+set +e
+"$REAL" "$@" 2> >(tee "$tmp_err" >&2) | tee "$tmp_out"; cli_rc=${PIPESTATUS[0]}
+wait
+set -e
+if [ "$cli_rc" -ne 0 ] && [ -x "$ACCOUNTS_HELPER" ] && command -v /usr/bin/python3 >/dev/null 2>&1; then
+  cls=$(cat "$tmp_out" "$tmp_err" | "/usr/bin/python3" "$ACCOUNTS_HELPER" classify --code "$cli_rc" 2>/dev/null || true)
+  case "$cls" in
+    quota)
+      "/usr/bin/python3" "$ACCOUNTS_HELPER" quota-hit >&2 || true
+      resume=$(grep -E -o -m1 -- '--conversation[= ][0-9a-fA-F-]{8,}' "$tmp_out" || true)
+      err "agy-guard: quota exhausted on the active account — marked exhausted, not retried"
+      [ -n "$resume" ] && err "agy-guard: resume with: agy $resume"
+      exit 4
+      ;;
+    disabled_403)
+      "/usr/bin/python3" "$ACCOUNTS_HELPER" disabled-hit >&2 || true
+      err "agy-guard: WARNING: account DISABLED (Terms of Service). Rotation HALTED — clear with: agy-guard accounts mark <name> ok --ack"
+      exit 5
+      ;;
+  esac
+fi
+exit "$cli_rc"
