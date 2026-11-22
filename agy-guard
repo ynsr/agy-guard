@@ -1,0 +1,636 @@
+#!/usr/bin/env bash
+# agy-guard — fail-closed proxy launcher and repair tool for the Antigravity CLI.
+#
+# Why: the CLI talks to Google account/antigravity endpoints. Running it outside
+# the local proxy risks an account ban, so nothing here is allowed to fall back
+# to a direct connection.
+#
+# Two jobs:
+#   launcher    called as `agy` (no management subcommand) it checks the proxy,
+#               exports HTTP(S)_PROXY/ALL_PROXY and execs the real CLI. Every
+#               CLI argument is forwarded untouched — including -h, --help,
+#               help and --version, which belong to the CLI, not to this tool.
+#   repair      `agy-guard` adds restore/verify/status so an accidental CLI
+#               reinstall cannot leave the machine without the proxy guard.
+#
+# Commands:
+#   agy-guard restore [--dry-run]   rewrite ~/.local/bin/agy from this file and
+#                                   strip installer PATH lines that would shadow
+#                                   it with the raw CLI binary
+#   agy-guard verify                compare installed launcher with this copy,
+#                                   check PATH resolution and shell profiles
+#   agy-guard status                verify + real CLI binary info (version read
+#                                   through the launcher, never the raw binary)
+#   agy-guard doctor                alias of verify (cli-hub doctor contract)
+#   agy-guard trace [opts] [-- cli args]
+#                                   run the CLI proxied through a chained logging
+#                                   proxy and record every domain it dials
+#                                     --log-file F   JSONL of each connection
+#                                     --summary F    JSON summary (default: <log>.summary.json)
+#                                     --upstream URL real proxy to forward to
+#   agy-guard --guard-help | --gh   this help
+#   agy-guard --guard-version       guard version (--version is the CLI's)
+#   agy-guard -- <args>             force pass-through for a management name
+#   agy-guard <any other args>      identical to `agy <args>` (proxied, checked)
+#
+# Options: --quiet/-q (no human output, exit code only), --json (machine
+#          readable verify/status/doctor result), --dry-run (restore).
+#
+# Environment: ANTIGRAVITY_PROXY (default http://127.0.0.1:10808),
+# ANTIGRAVITY_CLI_BIN (real CLI path), AGY_GUARD_PROBE_URL (probe endpoint).
+#
+# Exit codes: 0 success · 1 runtime error · 2 usage error · 3 proxy/precondition
+#             failure (refused to run without a working tunnel).
+set -u
+
+GUARD_VERSION="1.1.0"
+NAME="$(basename "$0")"
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+INSTALLED="$HOME/.local/bin/agy"
+RC_FILES="$HOME/.bashrc $HOME/.zshrc $HOME/.bash_profile $HOME/.profile"
+REAL="${ANTIGRAVITY_CLI_BIN:-$HOME/.local/share/antigravity-cli/agy}"
+PROXY="${ANTIGRAVITY_PROXY:-http://127.0.0.1:10808}"
+PROBE_URL="${AGY_GUARD_PROBE_URL:-https://www.google.com/generate_204}"
+BYPASS="localhost,127.0.0.1,::1"
+QUIET=0
+DRY_RUN=0
+JSON=0
+
+say() { [ "$QUIET" -eq 1 ] || printf '%s\n' "$*"; }
+err() { printf '%s: %s\n' "$NAME" "$*" >&2; }
+
+die_usage() { err "$*"; err "try: $NAME --guard-help"; exit 2; }
+die_net() {
+  err "$*"
+  err "refusing to run the Antigravity CLI without a working proxy ($PROXY)"
+  exit 3
+}
+
+usage() {
+  awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "$SELF"
+}
+
+# ---------------------------------------------------------------- management
+strip_shadowing_path_lines() {
+  local changed=0 f
+  for f in $RC_FILES; do
+    [ -f "$f" ] || continue
+    grep -q 'antigravity-cli:\$PATH' "$f" 2>/dev/null || continue
+    if [ "$DRY_RUN" -eq 1 ]; then
+      say "  would strip installer PATH line(s) from $f"
+      changed=1
+      continue
+    fi
+    python3 - "$f" <<'PY'
+import sys
+p = sys.argv[1]
+lines = open(p, encoding='utf-8', errors='surrogateescape').read().splitlines(True)
+kept = [l for l in lines if 'antigravity-cli:$PATH' not in l]
+open(p, 'w', encoding='utf-8', errors='surrogateescape').writelines(kept)
+print(f"  stripped {len(lines) - len(kept)} PATH line(s) from {p}")
+PY
+    changed=1
+  done
+  [ "$changed" -eq 0 ] && say "  no installer PATH lines found in shell profiles"
+  return 0
+}
+
+launcher_fingerprint() {
+  # the exec'd launcher body: first launcher line through the final exec
+  sed -n '/^\[ -x "\$REAL" \] || {/,/^exec "\$REAL" "\$@"$/p' "$1"
+}
+
+do_restore() {
+  say "agy-guard: restoring $INSTALLED"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    say "  would write $(stat -c '%s bytes' "$SELF") to $INSTALLED"
+  else
+    mkdir -p "$(dirname "$INSTALLED")" || { err "cannot create $(dirname "$INSTALLED")"; exit 1; }
+    if [ -f "$INSTALLED" ] && cmp -s "$SELF" "$INSTALLED"; then
+      say "  already identical to this copy"
+    else
+      cp -f "$SELF" "$INSTALLED" && chmod 755 "$INSTALLED" || { err "failed to write $INSTALLED"; exit 1; }
+      say "  installed $(stat -c '%s bytes' "$INSTALLED")"
+    fi
+  fi
+  say "agy-guard: shell profiles"
+  strip_shadowing_path_lines
+  say "agy-guard: done — verify with: agy-guard verify"
+}
+
+do_verify() {
+  local mode="$1" rc=0 shadows f found=0 seen="" d state
+  local st_launcher="ok" st_path="ok" st_profiles="ok" msg="" first_problem=""
+  local -a lines=()
+
+  lines+=("agy-guard: installed launcher -> $INSTALLED")
+  if [ ! -e "$INSTALLED" ]; then
+    st_launcher="missing"; lines+=("  MISSING — run: agy-guard restore"); rc=1
+    first_problem="launcher missing at $INSTALLED"
+  elif head -c 4 "$INSTALLED" 2>/dev/null | grep -q $'\x7fELF'; then
+    st_launcher="replaced-by-binary"
+    lines+=("  REPLACED BY A RAW ELF BINARY — no proxy enforcement. Run: agy-guard restore"); rc=1
+    first_problem="~/.local/bin/agy is a raw CLI binary (no proxy enforcement)"
+  elif cmp -s <(launcher_fingerprint "$SELF") <(launcher_fingerprint "$INSTALLED"); then
+    lines+=("  launcher logic matches this copy")
+  else
+    st_launcher="differs"; lines+=("  launcher logic DIFFERS from this copy — run: agy-guard restore"); rc=1
+    first_problem="installed launcher differs from this guard copy"
+  fi
+
+  lines+=("agy-guard: PATH resolution for 'agy'")
+  IFS=':'
+  for d in $PATH; do
+    [ -n "$d" ] || continue
+    d="$(cd "$d" 2>/dev/null && pwd -P)" || continue
+    case ":$seen:" in *":$d:"*) continue ;; esac
+    seen="$seen:$d"
+    [ -x "$d/agy" ] || continue
+    if [ "$found" -eq 0 ]; then
+      lines+=("  first: $d/agy")
+      if [ "$d/agy" != "$(readlink -f "$INSTALLED" 2>/dev/null || printf '%s' "$INSTALLED")" ]; then
+        st_path="shadowed"; lines+=("  SHADOWED by $d/agy"); rc=1
+        first_problem="${first_problem:-a PATH entry shadows the launcher: $d/agy}"
+      fi
+    else
+      lines+=("  also:  $d/agy")
+    fi
+    found=$((found + 1))
+  done
+  unset IFS
+  if [ "$found" -eq 0 ]; then
+    st_path="missing"; lines+=("  'agy' not on PATH — run: agy-guard restore"); rc=1
+    first_problem="${first_problem:-'agy' is not on PATH}"
+  fi
+
+  lines+=("agy-guard: shell profiles")
+  shadows=$(grep -l 'antigravity-cli:\$PATH' $RC_FILES 2>/dev/null)
+  if [ -n "$shadows" ]; then
+    st_profiles="dirty"
+    lines+=("  PATH prepends that would shadow the launcher:")
+    for f in $shadows; do lines+=("    $f"); done
+    rc=1
+    first_problem="${first_problem:-installer PATH lines found in shell profiles}"
+  else
+    lines+=("  clean")
+  fi
+
+  if [ "$mode" = "status" ]; then
+    lines+=("agy-guard: real CLI binary")
+    if [ -x "$REAL" ]; then
+      lines+=("  $REAL ($(stat -c '%s bytes, %y' "$REAL"))")
+      if [ "$JSON" -eq 0 ] && [ -x "$INSTALLED" ] && head -c 2 "$INSTALLED" 2>/dev/null | grep -q '#!'; then
+        state=$("$INSTALLED" --version 2>/dev/null | head -1)
+        lines+=("  version: ${state:-unknown}")
+      fi
+    else
+      lines+=("  MISSING: $REAL"); rc=1
+      first_problem="${first_problem:-CLI binary missing at $REAL}"
+    fi
+  fi
+
+  if [ "$JSON" -eq 1 ]; then
+    local jstatus="ok"
+    [ "$rc" -eq 0 ] || jstatus="stale"
+    [ "$st_launcher" = "missing" ] && jstatus="missing"
+    local jmsg="${first_problem:-launcher, PATH and shell profiles are consistent}"
+    printf '{"status":"%s","message":"%s","checks":{"launcher":"%s","path":"%s","profiles":"%s"}}\n' \
+      "$jstatus" "$jmsg" "$st_launcher" "$st_path" "$st_profiles"
+    return "$rc"
+  fi
+
+  if [ "$QUIET" -eq 0 ]; then printf '%s\n' "${lines[@]}"; fi
+  if [ "$rc" -eq 0 ]; then say "agy-guard: OK"; else say "agy-guard: PROBLEMS FOUND (see above)"; fi
+  return "$rc"
+}
+
+# ---------------------------------------------------------------- proxy gate
+# Fail-closed precondition used by both the launcher and `trace`: the proxy must
+# be an http(s) URL, listening, and able to reach Google. Exits 2 (usage) or 3
+# (precondition) on failure — never returns non-zero.
+assert_proxy_ok() {
+  local p="$1" hostport ph pp code attempt
+  case "$p" in
+    http://*|https://*) ;;
+    *) die_usage "proxy must be an http(s) proxy URL, got: $p" ;;
+  esac
+  hostport="${p#*://}"; hostport="${hostport%%/*}"
+  ph="${hostport%%:*}"
+  pp="${hostport##*:}"
+  [ "$pp" = "$hostport" ] && pp=80
+
+  if ! timeout 4 bash -c "exec 3<>/dev/tcp/$ph/$pp" 2>/dev/null; then
+    die_net "proxy $ph:$pp is not reachable"
+  fi
+
+  code=""
+  for attempt in 1 2; do
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 -x "$p" "$PROBE_URL" 2>/dev/null)
+    case "${code:-000}" in
+      2*|3*) break ;;
+      *) code="${code:-000}" ;;
+    esac
+  done
+  case "${code:-000}" in
+    2*|3*) ;;
+    *) die_net "proxy $p cannot reach Google (probe returned HTTP ${code:-000})" ;;
+  esac
+}
+
+# ---------------------------------------------------------------- trace
+# Runs the CLI as a child with HTTP(S)_PROXY pointed at a chained logging proxy
+# that forwards to the real proxy, so every CONNECT/absolute-URI host the CLI
+# asks for is recorded while traffic still leaves through the tunnel.
+do_trace() {
+  local log_file="" summary_file="" upstream="$PROXY"
+  local -a cli_args=()
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --log-file) [ $# -ge 2 ] || die_usage "--log-file needs a path"; log_file="$2"; shift 2 ;;
+      --summary) [ $# -ge 2 ] || die_usage "--summary needs a path"; summary_file="$2"; shift 2 ;;
+      --upstream) [ $# -ge 2 ] || die_usage "--upstream needs a URL"; upstream="$2"; shift 2 ;;
+      --json) JSON=1; shift ;;
+      --quiet|-q) QUIET=1; shift ;;
+      --) shift; cli_args+=("$@"); break ;;
+      -*) die_usage "unknown option for trace: $1" ;;
+      *) cli_args+=("$1"); shift ;;
+    esac
+  done
+
+  [ -n "$log_file" ] || log_file="${XDG_STATE_HOME:-$HOME/.local/state}/agy-guard/trace-$(date -u +%Y%m%dT%H%M%SZ).jsonl"
+  [ -n "$summary_file" ] || summary_file="${log_file%.jsonl}.summary.json"
+  local direct_file="$log_file.direct.jsonl"
+  mkdir -p "$(dirname "$log_file")" "$(dirname "$summary_file")" || { err "cannot create log directory"; exit 1; }
+  [ -x "$REAL" ] || { err "CLI binary not found or not executable: $REAL"; exit 1; }
+
+  # the upstream path itself must be a working proxied path (fail closed)
+  command -v assert_proxy_ok >/dev/null 2>&1 || { err "internal error: proxy gate missing"; exit 1; }
+  assert_proxy_ok "$upstream"
+
+  local py port_file proxy_url trace_pid child_rc=0 watch_pid="" TRACE_INT=0 LOGGER_STOPPED=0
+  py="$(mktemp "${TMPDIR:-/tmp}/agy-guard-trace.XXXXXX.py")"
+  port_file="$(mktemp "${TMPDIR:-/tmp}/agy-guard-port.XXXXXX")"
+  cleanup_trace() {
+    [ -n "${watch_pid:-}" ] && kill "$watch_pid" 2>/dev/null
+    [ -n "${trace_pid:-}" ] && kill "$trace_pid" 2>/dev/null
+    rm -f "${py:-}" "${port_file:-}"
+  }
+  trap cleanup_trace EXIT
+  trap 'TRACE_INT=1' INT
+  trap 'stop_logger; exit 143' TERM
+
+  cat >"$py" <<'PY'
+#!/usr/bin/env python3
+"""Chained logging proxy for `agy-guard trace` (stdlib only).
+
+Accepts proxy requests from the CLI, records the requested host in JSONL, and
+forwards everything to the real upstream proxy — so the CLI keeps running
+proxied while its destination domains are captured.
+"""
+import argparse
+import json
+import signal
+import socket
+import socketserver
+import sys
+import threading
+from datetime import datetime, timezone
+from urllib.parse import urlsplit
+
+
+def now():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+class Log:
+    def __init__(self, path, direct_path):
+        self.path = path
+        self.direct_path = direct_path
+        self.lock = threading.Lock()
+        self.entries = {}
+        self.fh = open(path, "a", buffering=1, encoding="utf-8")
+        open(direct_path, "a", encoding="utf-8").close()
+
+    def add(self, host, port, kind):
+        t = now()
+        with self.lock:
+            key = (host, port, kind)
+            e = self.entries.get(key)
+            if e is None:
+                e = {"host": host, "port": port, "kind": kind, "count": 0,
+                     "first_seen": t, "last_seen": t}
+                self.entries[key] = e
+            e["count"] += 1
+            e["last_seen"] = t
+            self.fh.write(json.dumps({"ts": t, "host": host, "port": port, "kind": kind}) + "\n")
+
+    def direct_peers(self):
+        peers = set()
+        try:
+            with open(self.direct_path, encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        peer = (json.loads(line) or {}).get("peer")
+                    except ValueError:
+                        continue
+                    if peer:
+                        peers.add(peer)
+        except OSError:
+            pass
+        return sorted(peers)
+
+
+class Handler(socketserver.StreamRequestHandler):
+    timeout = 600
+
+    def handle(self):
+        first = self.rfile.readline()
+        if not first:
+            return
+        line = first.decode("latin-1").rstrip("\r\n")
+        parts = line.split()
+        if len(parts) < 2:
+            return
+        method, target = parts[0], parts[1]
+        headers = []
+        while True:
+            h = self.rfile.readline()
+            if not h or h in (b"\r\n", b"\n"):
+                break
+            headers.append(h)
+
+        if method.upper() == "CONNECT":
+            host, _, port_s = target.rpartition(":")
+            host = host.strip("[]") or target
+            try:
+                port = int(port_s)
+            except ValueError:
+                port, host = 443, target
+            self.server.log.add(host, port, "connect")
+            self._tunnel(host, port, None)
+        else:
+            try:
+                u = urlsplit(target)
+                host = u.hostname or target
+                port = u.port or (443 if u.scheme == "https" else 80)
+            except ValueError:
+                host, port = target, 80
+            self.server.log.add(host, port, "http")
+            self._tunnel(host, port, first + b"".join(headers) + b"\r\n")
+
+    def _tunnel(self, host, port, head):
+        try:
+            up = socket.create_connection((self.server.up_host, self.server.up_port), timeout=60)
+        except OSError:
+            return
+        try:
+            if head is not None:
+                up.sendall(head)
+            else:
+                up.sendall(("CONNECT %s:%d HTTP/1.1\r\nHost: %s:%d\r\n\r\n"
+                            % (host, port, host, port)).encode())
+                resp = b""
+                while b"\r\n\r\n" not in resp:
+                    chunk = up.recv(4096)
+                    if not chunk:
+                        break
+                    resp += chunk
+                self.wfile.write(resp)
+                self.wfile.flush()
+                if b" 200 " not in resp.split(b"\r\n", 1)[0]:
+                    return
+            self._relay(up)
+        except OSError:
+            pass
+        finally:
+            try:
+                up.close()
+            except OSError:
+                pass
+
+    def _relay(self, up):
+        client = self.connection
+
+        def pump(src, dst):
+            try:
+                while True:
+                    data = src.recv(65536)
+                    if not data:
+                        break
+                    dst.sendall(data)
+            except OSError:
+                pass
+            finally:
+                try:
+                    dst.shutdown(socket.SHUT_WR)
+                except OSError:
+                    pass
+
+        t = threading.Thread(target=pump, args=(up, client), daemon=True)
+        t.start()
+        pump(client, up)
+        t.join(5)
+
+
+class Server(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--upstream", required=True)
+    ap.add_argument("--log", required=True)
+    ap.add_argument("--summary", required=True)
+    ap.add_argument("--direct-file", required=True)
+    ap.add_argument("--port-file", required=True)
+    ap.add_argument("--quiet", action="store_true")
+    a = ap.parse_args()
+
+    u = urlsplit(a.upstream)
+    log = Log(a.log, a.direct_file)
+    server = Server(("127.0.0.1", 0), Handler)
+    server.log = log
+    server.up_host = u.hostname or "127.0.0.1"
+    server.up_port = u.port or 80
+    started = now()
+
+    with open(a.port_file, "w", encoding="utf-8") as fh:
+        fh.write(str(server.server_address[1]))
+
+    def finish(*_):
+        payload = {
+            "tool": "agy-guard trace",
+            "started_at": started,
+            "finished_at": now(),
+            "upstream_proxy": a.upstream,
+            "log_file": a.log,
+            "domains": sorted(log.entries.values(), key=lambda e: (e["host"], e["port"])),
+            "direct_connections": log.direct_peers(),
+        }
+        try:
+            with open(a.summary, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, indent=2)
+                fh.write("\n")
+        except OSError:
+            pass
+        if not a.quiet:
+            rows = payload["domains"]
+            sys.stderr.write("\n  %-46s %-6s %-8s %s\n" % ("DOMAIN", "PORT", "KIND", "COUNT"))
+            for e in rows:
+                sys.stderr.write("  %-46s %-6d %-8s %d\n" % (e["host"], e["port"], e["kind"], e["count"]))
+            if not rows:
+                sys.stderr.write("  (no proxied connections observed)\n")
+            if payload["direct_connections"]:
+                sys.stderr.write("\n  WARNING: direct (unproxied) connections observed:\n")
+                for peer in payload["direct_connections"]:
+                    sys.stderr.write("    %s\n" % peer)
+            sys.stderr.write("\n")
+            sys.stderr.flush()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, finish)
+    signal.signal(signal.SIGINT, finish)
+    server.serve_forever(poll_interval=0.2)
+
+
+if __name__ == "__main__":
+    main()
+PY
+
+  local py_quiet=""
+  [ "$QUIET" -eq 1 ] && py_quiet="--quiet"
+  python3 "$py" --upstream "$upstream" --log "$log_file" --summary "$summary_file" \
+    --direct-file "$direct_file" --port-file "$port_file" $py_quiet 2>/dev/null &
+  trace_pid=$!
+
+  local i=0
+  while [ ! -s "$port_file" ]; do
+    i=$((i + 1))
+    if [ "$i" -gt 100 ] || ! kill -0 "$trace_pid" 2>/dev/null; then
+      err "logging proxy failed to start"
+      exit 1
+    fi
+    sleep 0.05
+  done
+  proxy_url="http://127.0.0.1:$(cat "$port_file")"
+
+  # leak watchdog: sample the CLI's socket table for non-loopback peers
+  (
+    while kill -0 "$trace_pid" 2>/dev/null; do
+      for p in $(pgrep -f "antigravity" 2>/dev/null); do
+        ss -tnp 2>/dev/null | grep "pid=$p," | awk '{print $5}' |
+          grep -vE '^(127\.|\[::1\]|\[::ffff:127\.)' |
+          sed 's/:[0-9]*$//' |
+          while read -r peer; do
+            printf '{"ts":"%s","peer":"%s"}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$peer" >>"$direct_file"
+          done
+      done
+      sleep 1
+    done
+  ) &
+  watch_pid=$!
+
+  say "agy-guard: tracing through $proxy_url -> $upstream"
+  say "agy-guard: log: $log_file"
+  say "agy-guard: summary: $summary_file"
+  say "agy-guard: the CLI runs proxied; quit it when you are done"
+
+  export HTTP_PROXY="$proxy_url"  http_proxy="$proxy_url"
+  export HTTPS_PROXY="$proxy_url" https_proxy="$proxy_url"
+  export ALL_PROXY="$proxy_url"   all_proxy="$proxy_url"
+  export NO_PROXY="$BYPASS"       no_proxy="$BYPASS"
+
+  LOGGER_STOPPED=0
+  stop_logger() {
+    [ "$LOGGER_STOPPED" -eq 1 ] && return 0
+    LOGGER_STOPPED=1
+    [ -n "${watch_pid:-}" ] && kill "$watch_pid" 2>/dev/null && watch_pid=""
+    if [ -n "${trace_pid:-}" ] && kill -0 "$trace_pid" 2>/dev/null; then
+      kill -TERM "$trace_pid" 2>/dev/null
+      wait "$trace_pid" 2>/dev/null
+    fi
+    return 0
+  }
+
+  "$REAL" "${cli_args[@]+"${cli_args[@]}"}"; child_rc=$?
+
+  stop_logger
+
+  if [ "$JSON" -eq 1 ] && [ -f "$summary_file" ]; then
+    cat "$summary_file"
+  else
+    say ""
+    say "agy-guard: trace finished (CLI exit $child_rc)"
+    say "  log (JSONL):  $log_file"
+    say "  summary:      $summary_file"
+    if [ -s "$direct_file" ]; then
+      say "  WARNING: direct (unproxied) connections were observed — see $direct_file"
+    fi
+    if command -v jq >/dev/null 2>&1 && [ -f "$summary_file" ]; then
+      say ""
+      say "  domains: $(jq -r '.domains | length' "$summary_file"), direct peers: $(jq -r '.direct_connections | length' "$summary_file")"
+    fi
+  fi
+  return "$child_rc"
+}
+
+# ---------------------------------------------------------------- dispatch
+if [ "$NAME" = "agy-guard" ]; then
+  # peel options that may appear before the subcommand …
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --quiet|-q) QUIET=1; shift ;;
+      --dry-run) DRY_RUN=1; shift ;;
+      --json) JSON=1; shift ;;
+      --output|-o) [ "${2:-}" = "json" ] && JSON=1; [ $# -ge 2 ] && shift 2 || shift ;;
+      *) break ;;
+    esac
+  done
+  cmd="${1:-}"
+  case "$cmd" in
+    restore|verify|status|doctor|trace|--guard-help|--gh|guard-help|--guard-version|--gv|guard-version|--)
+      shift || true
+      ;;
+  esac
+  # … and again after it, so `verify --json` / `restore --dry-run` also work
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --quiet|-q) QUIET=1; shift ;;
+      --dry-run) DRY_RUN=1; shift ;;
+      --json) JSON=1; shift ;;
+      --output|-o) [ "${2:-}" = "json" ] && JSON=1; [ $# -ge 2 ] && shift 2 || shift ;;
+      *) break ;;
+    esac
+  done
+  case "$cmd" in
+    restore|verify|status|doctor)
+      [ $# -gt 0 ] && { err "unknown option for '$cmd': $1"; err "try: $NAME --guard-help"; exit 2; }
+      ;;
+  esac
+  case "$cmd" in
+    restore) do_restore; exit 0 ;;
+    verify|doctor) do_verify verify; exit $? ;;
+    status) do_verify status; exit $? ;;
+    trace) do_trace "$@"; exit $? ;;
+    --guard-help|--gh|guard-help) usage; exit 0 ;;
+    --guard-version|--gv|guard-version) printf 'agy-guard %s\n' "$GUARD_VERSION"; exit 0 ;;
+    --) : ;;  # explicit pass-through
+  esac
+fi
+
+# ---------------------------------------------------------------- launcher
+[ -x "$REAL" ] || { err "CLI binary not found or not executable: $REAL"; exit 1; }
+assert_proxy_ok "$PROXY"
+
+# 3) hand the proxied environment to the CLI and everything it spawns
+export HTTP_PROXY="$PROXY"  http_proxy="$PROXY"
+export HTTPS_PROXY="$PROXY" https_proxy="$PROXY"
+export ALL_PROXY="$PROXY"   all_proxy="$PROXY"
+export NO_PROXY="$BYPASS"   no_proxy="$BYPASS"
+
+exec "$REAL" "$@"
