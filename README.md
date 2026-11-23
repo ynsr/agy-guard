@@ -52,6 +52,8 @@ agy-guard -- restore        # force pass-through for a management name
 | 1 | runtime error (CLI binary missing, write failure) |
 | 2 | usage error (bad proxy URL, unknown option for a management command) |
 | 3 | proxy/precondition failure — refused to run without a working tunnel |
+| 4 | account condition — quota-exhausted, or nothing to switch to (never retried) |
+| 5 | account disabled (Terms of Service) — rotation halted, clear with `accounts mark <name> ok --ack` |
 
 ## Commands
 
@@ -65,9 +67,22 @@ agy-guard -- restore        # force pass-through for a management name
 | `agy-guard --guard-help` / `--gh` | guard help |
 | `agy-guard --guard-version` | guard version |
 | `agy-guard <args…>` | identical to `agy <args…>`: proxied, checked, forwarded |
+| `agy-guard accounts list [--json]` | registered accounts, state, reset hints (`*` = active) |
+| `agy-guard accounts current [--json]` | active account name |
+| `agy-guard accounts add <name>` | register the CURRENT live login as `<name>` (snapshot only) |
+| `agy-guard accounts capture` | re-snapshot the live login into the active entry |
+| `agy-guard accounts use <name\|next> [--force]` | switch the live login (30-min dwell unless `--force`) |
+| `agy-guard accounts mark <name> ok\|exhausted\|disabled [--until ISO8601] [--ack]` | set state; `--ack` clears a rotation halt |
+| `agy-guard accounts remove <name> [--purge] [--dry-run]` | delete a snapshot (`--purge` also wipes live files) |
+| `agy-guard accounts verify [--json]` | snapshot integrity, identity, perms, proxy |
+| `agy-guard accounts backup --out FILE [--dry-run]` | credential bundle (**plaintext**, mode 0600 — encrypt with age/gpg immediately) |
+| `agy-guard accounts restore FILE [--dry-run]` | restore snapshots from a bundle |
+| `agy-guard accounts prompt` | active account name (cheap, for the shell prompt) |
 
 Options: `--quiet/-q` (no human output, exit code only), `--json` (machine
-readable `verify`/`status`/`doctor` result, see below), `--dry-run` (restore).
+readable result, see below), `--dry-run` (restore/remove/backup),
+`--force` (`accounts use`: skip the dwell wait). `--` forces CLI
+pass-through if the CLI ever gains an `accounts` subcommand of its own.
 
 `--json` emits the `cli-hub doctor` envelope:
 
@@ -162,7 +177,9 @@ launcher logic drifted from this copy, a PATH entry shadowing `agy`, and
 ## Tests
 
 ```bash
-bats tests/guard.bats       # 21 tests, hermetic
+bats tests/guard.bats       # 25 tests, hermetic
+bats tests/accounts.bats    # 17 tests: classifier, isolated-keyring
+                            # add/switch/rollback/quota/403/backup + launcher assist/exits
 ```
 
 The suite uses a stub CLI and a stub HTTP proxy on loopback with a plain-HTTP
@@ -194,3 +211,10 @@ install/link/uninstall idempotency.
 - Behaviour change from the ad-hoc version this tool replaced: proxy refusal
   used to exit `78`; it is now `3` (network/precondition), per the repo
   convention.
+- Multi-account rules (see `docs/agy-accounts-discovery.md`): one account at a
+  time, never concurrent use; quota state comes only from errors the official
+  CLI itself emits — no quota-API polling or scraping; account B is added by a
+  normal interactive `agy` login while A's snapshot is already stored (never
+  `/logout`, never revoking); auto-switching ships disabled and needs config
+  plus `--i-understand-tos-risk`; manual switching between your own paid
+  accounts is fine, automated cycling to dodge quota is a ToS violation.
