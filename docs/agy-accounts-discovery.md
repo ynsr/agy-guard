@@ -7,7 +7,7 @@ are recorded in this document — only shapes, sizes, labels and attribute
 names.
 
 **Assumptions.** Single live login today (account A,
-`shefvbrian20@gmail.com`); account B does not exist yet on this machine.
+`s***@gmail.com`); account B does not exist yet on this machine.
 `~/.gemini/antigravity-cli/` belongs to the current CLI generation
 (`jetski_state.pbtxt`, `settings.json` with no `modelProvider` key).
 `busctl --user list` shows `org.freedesktop.secrets` owned by
@@ -69,10 +69,10 @@ The live email is derivable offline from the `id_token` JWT claim in either
 
 - claims: `iss, azp, aud, sub, email, email_verified, name, picture,
   given_name, family_name, iat, exp, at_hash`
-- `email = shefvbrian20@gmail.com`, `email_verified = True`.
+- `email = s***@gmail.com`, `email_verified = True`.
 
-`google_accounts.json.active` agrees (`"shefvbrian20@gmail.com"`,
-`old: ["brian.shefveland.90@gmail.com"]` — a previous account address still
+`google_accounts.json.active` agrees (`"s***@gmail.com"`,
+`old: ["b***@gmail.com"]` — a previous account address still
 recorded there). No model call needed. Caveat: `expiry_date`/`exp`
 (1795332166000 ms ≈ year 2026) look server-issued and odd; treat expiry as
 untrusted, email as trusted.

@@ -52,6 +52,7 @@ EOF
   export ANTIGRAVITY_CLI_BIN="$STUB"
   export ANTIGRAVITY_PROXY="http://127.0.0.1:$PROXY_PORT"
   export AGY_GUARD_PROBE_URL="http://probe.invalid/generate_204"
+  export AGY_GUARD_PGREP_PATTERN="$BATS_TEST_TMPDIR/.*(antigravity-cli/agy|local/bin/agy)( |$)"
 }
 
 # --- isolated-keyring fixtures -------------------------------------------
@@ -151,30 +152,31 @@ PY
   run "$HELPER" list
   [ "$status" -eq 0 ]
   [[ "$output" == *"a***@example.com"* ]]
-  # swap the live login behind the helper's back, then register b
+  # swap the live login behind the helper's back -> use must STOP, never guess
   make_login b@example.com B
-  run "$HELPER" add b
-  [ "$status" -eq 0 ]
-  # recorded active is a (email A) but live is B -> use must STOP, never guess
-  run "$HELPER" use b
+  run "$HELPER" use a
   [ "$status" -eq 1 ]
   [[ "$output" == *"refusing to guess"* ]]
 }
 
-@test "capture re-points active, then a forced switch swaps live files" {
+@test "add second account updates active, then forced switch swaps live files and keyring" {
   keyring_setup
   make_login a@example.com A
   run "$HELPER" add a
   [ "$status" -eq 0 ]
   make_login b@example.com B
-  run "$HELPER" capture
+  run "$HELPER" add b
   [ "$status" -eq 0 ]
-  # now recorded active email == live B; craft a second account from the
-  # current live login is impossible (same login), so emulate B's snapshot
-  # by adding under a new name after re-pointing: switch to self is a no-op
+  run "$HELPER" current
+  [ "$status" -eq 0 ]
+  [ "$output" = "b" ]
   run "$HELPER" --force use a
   [ "$status" -eq 0 ]
-  [[ "$output" == *"already on"* ]]
+  [[ "$output" == *"switched b -> a"* ]]
+  grep -q '"tag":"A"' "$AGY_GUARD_GEMINI_DIR/jetski-standalone-oauth-token"
+  grep -q 'a@example.com' "$AGY_GUARD_GEMINI_DIR/google_accounts.json"
+  run /usr/bin/python3 -c 'import secretstorage; bus=secretstorage.dbus_init(); print(list(secretstorage.search_items(bus, {"service":"gemini","username":"antigravity"}))[0].get_secret().decode())'
+  [ "$output" = "live-secret-A" ]
   run "$HELPER" verify
   [ "$status" -eq 0 ]
 }
@@ -215,19 +217,9 @@ PY
   make_login b@example.com B
   run "$HELPER" add b
   [ "$status" -eq 0 ]
-  # heal the mismatch (capture B into active a), switch away and back
-  # is unnecessary: simulate drift on NON-active b and confirm purge
-  # refuses rather than wiping the live login's files
-  run "$HELPER" capture
-  [ "$status" -eq 0 ]
-  AGY_GUARD_STATE_DIR="$AGY_GUARD_STATE_DIR" python3 - <<'EOF'
-import json, os
-p = os.path.join(os.environ["AGY_GUARD_STATE_DIR"], "accounts.json")
-d = json.load(open(p))
-d["accounts"]["b"]["email"] = "drifted@example.com"
-json.dump(d, open(p, "w"))
-EOF
-  run "$HELPER" remove b --purge
+  # active is b (live B); remove non-active a with --purge must refuse
+  # rather than wiping B's live files
+  run "$HELPER" remove a --purge
   [ "$status" -eq 1 ]
   [[ "$output" == *"refusing to delete"* ]]
 }
@@ -319,4 +311,72 @@ EOF
   # ...but anything that can change the live login still refuses first
   ANTIGRAVITY_PROXY="http://127.0.0.1:9" run "$GUARD" accounts use next
   [ "$status" -eq 3 ]
+}
+
+@test "launcher assist halts without TTY on exhausted active, and strips --i-understand-tos-risk" {
+  keyring_setup
+  make_login a@example.com A
+  run "$HELPER" add a
+  [ "$status" -eq 0 ]
+  make_login b@example.com B
+  run "$HELPER" add b
+  [ "$status" -eq 0 ]
+  # b is active; mark b exhausted while a is ok -> non-TTY launcher must exit 4
+  run "$HELPER" quota-hit --reset-hint 2999-01-01T00:00:00Z
+  [ "$status" -eq 0 ]
+  run "$GUARD" models
+  [ "$status" -eq 4 ]
+  [[ "$output" == *"not switching without a TTY"* ]]
+  # mark b ok and verify --i-understand-tos-risk is stripped before calling $REAL
+  run "$HELPER" mark b ok
+  [ "$status" -eq 0 ]
+  run "$GUARD" --i-understand-tos-risk models
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ARGS: models"* ]]
+  [[ "$output" != *"--i-understand-tos-risk"* ]]
+}
+
+@test "do_switch rolls back live files if write_live fails mid-switch" {
+  keyring_setup
+  make_login a@example.com A
+  run "$HELPER" add a
+  [ "$status" -eq 0 ]
+  make_login b@example.com B
+  run "$HELPER" add b
+  [ "$status" -eq 0 ]
+  # Corrupt a's snapshot in accounts.json? No, inject a failure by making
+  # oauth_creds.json immutable? Better: test via python importing agy-accounts
+  # with write_live raising an error on live_secret_write.
+  run /usr/bin/python3 - <<'PY'
+import importlib.machinery, importlib.util, os
+loader = importlib.machinery.SourceFileLoader("agy_accounts", os.environ["HELPER"])
+spec = importlib.util.spec_from_loader("agy_accounts", loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+orig = mod.live_secret_write
+calls = [0]
+def boom(*a, **kw):
+    calls[0] += 1
+    if calls[0] == 1:
+        raise RuntimeError("injected keyring failure")
+    return orig(*a, **kw)
+mod.live_secret_write = boom
+d = mod.load_state()
+rc, msg = mod.do_switch(d, "a", force=True)
+assert rc == 1 and "live login restored" in msg, (rc, msg)
+PY
+  [ "$status" -eq 0 ]
+  grep -q '"tag":"B"' "$AGY_GUARD_GEMINI_DIR/jetski-standalone-oauth-token"
+  grep -q 'b@example.com' "$AGY_GUARD_GEMINI_DIR/google_accounts.json"
+}
+
+@test "list --json redacts email local-parts" {
+  keyring_setup
+  make_login alice@example.com A
+  run "$HELPER" add a
+  [ "$status" -eq 0 ]
+  run "$HELPER" --json list
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"a***@example.com"* ]]
+  [[ "$output" != *"alice@example.com"* ]]
 }

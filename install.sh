@@ -145,14 +145,24 @@ do_install() {
       log_ok "Installed $dir/agy-accounts (copy of $HELPER_SRC)"
     fi
   else
-    # guard already current (ALREADY=1): still lay down a missing helper
-    # (upgrades from pre-accounts installs otherwise never get it)
+    # guard already current (ALREADY=1): lay down or update the helper if needed
+    local need_helper=0
     if [ ! -e "$dir/agy-accounts" ]; then
-      local htmp2; htmp2="$(mktemp "$dir/.agy-accounts.XXXXXX")"
-      if [ "$LINK_MODE" -eq 1 ]; then
+      need_helper=1
+    elif [ "$LINK_MODE" -eq 1 ]; then
+      [ "$(readlink -f "$dir/agy-accounts")" != "$(readlink -f "$HELPER_SRC")" ] && need_helper=1
+    elif ! cmp -s "$HELPER_SRC" "$dir/agy-accounts"; then
+      need_helper=1
+    fi
+    if [ "$need_helper" -eq 1 ]; then
+      if [ "$DRY_RUN" -eq 1 ]; then
+        log_info "would: install $dir/agy-accounts (accounts helper)"
+      elif [ "$LINK_MODE" -eq 1 ]; then
+        local htmp2; htmp2="$(mktemp -u "$dir/.agy-accounts.XXXXXX")"
         ln -s "$HELPER_SRC" "$htmp2"; mv -f "$htmp2" "$dir/agy-accounts"
         log_ok "Linked $dir/agy-accounts -> $HELPER_SRC"
       else
+        local htmp2; htmp2="$(mktemp "$dir/.agy-accounts.XXXXXX")"
         cp -f "$HELPER_SRC" "$htmp2"; chmod 755 "$htmp2"; mv -f "$htmp2" "$dir/agy-accounts"
         log_ok "Installed $dir/agy-accounts (copy of $HELPER_SRC)"
       fi

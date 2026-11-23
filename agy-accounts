@@ -398,7 +398,7 @@ def cmd_list(args):
     rows = []
     for name in sorted(d["accounts"]):
         a = d["accounts"][name]
-        rows.append({"name": name, "email": a.get("email"),
+        rows.append({"name": name, "email": redact_email(a.get("email")),
                      "state": a.get("state", "unknown"),
                      "reset_hint": a.get("reset_hint"),
                      "last_used": a.get("last_used"),
@@ -441,8 +441,7 @@ def cmd_add(args):
                                     "last_used": now,
                                     "snapshot_parts": nparts,
                                     "snapshot_updated_at": now}
-        if d.get("active") is None:
-            d["active"] = args.name
+        d["active"] = args.name
         save_state(d)
     if not args.quiet:
         eprint(f"{APP}: registered '{args.name}' "
@@ -470,20 +469,44 @@ def cmd_capture(args):
     return 0
 
 
+def _ancestor_pids():
+    ancestors = {os.getpid()}
+    pid = os.getppid()
+    while pid > 1 and pid not in ancestors:
+        ancestors.add(pid)
+        try:
+            with open(f"/proc/{pid}/stat", encoding="utf-8") as fh:
+                stat = fh.read()
+            # comm can contain spaces/parens; ppid is the 2nd field after ')'
+            after_comm = stat.rsplit(")", 1)[1].split()
+            pid = int(after_comm[1])
+        except (OSError, ValueError, IndexError):
+            break
+    return ancestors
+
+
 def _agy_running():
+    pattern = os.environ.get(
+        "AGY_GUARD_PGREP_PATTERN",
+        r"(antigravity-cli/agy|local/bin/agy)( |$)")
     try:
-        r = subprocess.run(["pgrep", "-af",
-                              r"(antigravity-cli/agy|local/bin/agy)( |$)"],
+        r = subprocess.run(["pgrep", "-af", pattern],
                            capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.SubprocessError):
         return []
-    own = {os.getpid(), os.getppid()}  # helper runs as the launcher's child
+    own = _ancestor_pids()
     pids = []
     for line in (r.stdout or "").splitlines():
-        if "agy-accounts" in line or "agy-guard" in line:
+        m = re.match(r"\s*(\d+)\s+(.*)$", line)
+        if not m:
             continue
-        m = re.match(r"\s*(\d+)\s", line)
-        if not m or int(m.group(1)) in own:
+        pid = int(m.group(1))
+        if pid in own:
+            continue
+        cmdline = m.group(2)
+        argv0 = cmdline.split(None, 1)[0]
+        base = os.path.basename(argv0)
+        if base in ("agy-accounts", "agy-guard"):
             continue
         pids.append(line.strip())
     return pids
@@ -700,7 +723,7 @@ def cmd_verify(args):
     sdir = state_dir()
     try:
         st = os.stat(sdir)
-        if st.st_mode & 0o777 & 0o027:
+        if st.st_mode & 0o777 & 0o077:
             problems.append(f"{sdir} permissions are too open "
                             f"({oct(st.st_mode & 0o777)})")
     except FileNotFoundError:
@@ -712,6 +735,14 @@ def cmd_verify(args):
     except FileNotFoundError:
         pass
     d = load_state()
+    active = d.get("active")
+    if active and active in d["accounts"]:
+        live_em = _live_email()
+        rec_em = d["accounts"][active].get("email")
+        if live_em is not None and live_em != rec_em:
+            problems.append(
+                f"live login ({redact_email(live_em)}) != recorded active "
+                f"'{active}' ({redact_email(rec_em)})")
     for name, a in d["accounts"].items():
         raw = secret_read(name)
         if raw is None:
@@ -823,12 +854,12 @@ def cmd_restore(args):
         for name, b64 in bundle.get("snapshots", {}).items():
             raw = _b64d(b64)
             snap = json.loads(raw.decode("utf-8"))
-            secret_write(name, raw)
+            nparts = secret_write(name, raw)
             d["accounts"][name] = {
                 "email": snap.get("email"), "state": "ok",
                 "exhausted_at": None, "reset_hint": None,
                 "last_used": utcnow(),
-                "snapshot_parts": len(raw) // CHUNK + 1,
+                "snapshot_parts": nparts,
                 "snapshot_updated_at": utcnow()}
         if d.get("active") not in d["accounts"] and names:
             d["active"] = names[0]

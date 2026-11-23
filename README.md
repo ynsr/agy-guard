@@ -77,7 +77,6 @@ agy-guard -- restore        # force pass-through for a management name
 | `agy-guard accounts verify [--json]` | snapshot integrity, identity, perms, proxy |
 | `agy-guard accounts backup --out FILE [--dry-run]` | credential bundle (**plaintext**, mode 0600 — encrypt with age/gpg immediately) |
 | `agy-guard accounts restore FILE [--dry-run]` | restore snapshots from a bundle |
-| `agy-guard accounts remove <name> --purge` | delete a snapshot AND its live login (only when the live login is that account; wipes files + keyring) |
 | `agy-guard accounts prompt` | active account name (cheap, for the shell prompt) |
 
 Options: `--quiet/-q` (no human output, exit code only), `--json` (machine
@@ -178,9 +177,9 @@ launcher logic drifted from this copy, a PATH entry shadowing `agy`, and
 ## Tests
 
 ```bash
-bats tests/guard.bats       # 21 tests, hermetic
-bats tests/accounts.bats    # 11 tests: classifier, isolated-keyring
-                            # add/switch/quota/403/backup + launcher exits
+bats tests/guard.bats       # 25 tests, hermetic
+bats tests/accounts.bats    # 17 tests: classifier, isolated-keyring
+                            # add/switch/rollback/quota/403/backup + launcher assist/exits
 ```
 
 The suite uses a stub CLI and a stub HTTP proxy on loopback with a plain-HTTP
