@@ -92,6 +92,7 @@ pass-through if the CLI ever gains an `accounts` subcommand of its own.
  "checks":{"launcher":"ok","path":"ok","profiles":"ok"}}
 ```
 
+`status` is `ok`, `stale` (something needs repair) or `missing`; the exit code
 still carries the verdict.
 
 ## Starting with a temporary custom endpoint
@@ -205,7 +206,7 @@ launcher logic drifted from this copy, a PATH entry shadowing `agy`, and
 ## Tests
 
 ```bash
-bats tests/guard.bats       # 25 tests, hermetic
+bats tests/guard.bats       # 33 tests, hermetic
 bats tests/accounts.bats    # 17 tests: classifier, isolated-keyring
                             # add/switch/rollback/quota/403/backup + launcher assist/exits
 ```

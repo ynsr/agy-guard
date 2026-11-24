@@ -27,6 +27,7 @@
 #                                   proxy and record every domain it dials
 #                                     --log-file F   JSONL of each connection
 #                                     --summary F    JSON summary (default: <log>.summary.json)
+#                                     --upstream URL real proxy to forward to
 #   agy-guard start --endpoint URL --model ID [--api-key KEY] [--defaults]
 #                                   [-- cli args]
 #                                 one-shot session against a temporary
@@ -53,7 +54,8 @@
 # Environment: ANTIGRAVITY_PROXY (default http://127.0.0.1:10808),
 # ANTIGRAVITY_CLI_BIN (real CLI path), AGY_GUARD_PROBE_URL (probe endpoint),
 # AGY_GUARD_STATE_DIR (default ~/.local/state/agy-guard),
-# AGY_GUARD_GEMINI_DIR (default ~/.gemini).
+# AGY_GUARD_GEMINI_DIR (default ~/.gemini),
+# AGY_GUARD_DEFAULT_ENDPOINT / AGY_GUARD_DEFAULT_MODEL (defaults for `start --defaults`).
 #
 # Exit codes: 0 success · 1 runtime error · 2 usage error · 3 proxy/precondition
 #             failure (refused to run without a working tunnel) ·
@@ -649,19 +651,27 @@ do_start() {
   [ -n "$endpoint" ] || die_usage "start: --endpoint URL is required (or use --defaults)"
   [ -n "$model" ] || die_usage "start: --model ID is required (or use --defaults)"
   case "$endpoint" in
-    http://*|https://*) ;;
-    *) die_usage "start: --endpoint must be an http(s) URL, got: $endpoint" ;;
+    http://[!/:]*|https://[!/:]*) ;;
+    *) die_usage "start: --endpoint must be an http(s) URL with a host, got: $endpoint" ;;
   esac
   # the gateway appends paths itself: strip one trailing /v1 (plus slashes)
-  # and any trailing slash so roots and /v1 forms converge
-  endpoint="${endpoint%/}"
+  # and any trailing slashes so roots and /v1 forms converge
+  while [[ "$endpoint" == */ ]]; do endpoint="${endpoint%/}"; done
   case "$endpoint" in
-    */v1) endpoint="${endpoint%/v1}" ;;
+    *://*/v1) endpoint="${endpoint%/v1}" ;;
   esac
+  while [[ "$endpoint" == */ ]]; do endpoint="${endpoint%/}"; done
 
   [ -x "$REAL" ] || { err "CLI binary not found or not executable: $REAL"; exit 1; }
-  if [ -f "${AGY_GUARD_GEMINI_DIR:-$HOME/.gemini}/antigravity-cli/settings.json" ] && \
-    grep -q '"modelProvider"' "${AGY_GUARD_GEMINI_DIR:-$HOME/.gemini}/antigravity-cli/settings.json" 2>/dev/null; then
+  local settings_file="${AGY_GUARD_GEMINI_DIR:-$HOME/.gemini}/antigravity-cli/settings.json"
+  if [ -f "$settings_file" ] && python3 -c '
+import json, sys
+try:
+    data = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+    sys.exit(1)
+sys.exit(0 if isinstance(data, dict) and bool(data.get("modelProvider")) else 1)
+' "$settings_file" 2>/dev/null; then
     err "start: settings.json sets modelProvider, which gateway mode does not use — remove it and retry"
     err "start: (settings.json is never modified by 'start')"
     exit 2
@@ -682,7 +692,7 @@ do_start() {
     unset AGY_LLM_GATEWAY_API_KEY
   fi
 
-  say "agy-guard: starting agy with temporary endpoint $endpoint (model: $model)"
+  say "agy-guard: starting agy with temporary endpoint $endpoint (model: $model)" >&2
   exec "$REAL" --model "$model" "${cli_args[@]+"${cli_args[@]}"}"
 }
 
@@ -704,16 +714,22 @@ if [ "$NAME" = "agy-guard" ]; then
       shift || true
       ;;
   esac
-  # … and again after it, so `verify --json` / `restore --dry-run` also work
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      --quiet|-q) QUIET=1; shift ;;
-      --dry-run) DRY_RUN=1; shift ;;
-      --json) JSON=1; shift ;;
-      --output|-o) [ "${2:-}" = "json" ] && JSON=1; [ $# -ge 2 ] && shift 2 || shift ;;
-      *) break ;;
-    esac
-  done
+  # … and again after it, so `verify --json` / `restore --dry-run` also work.
+  # Skip for `start` so CLI flags like `--output json` immediately after `start`
+  # are forwarded to the CLI instead of silently consumed.
+  case "$cmd" in
+    restore|verify|status|doctor|trace|accounts)
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --quiet|-q) QUIET=1; shift ;;
+          --dry-run) DRY_RUN=1; shift ;;
+          --json) JSON=1; shift ;;
+          --output|-o) [ "${2:-}" = "json" ] && JSON=1; [ $# -ge 2 ] && shift 2 || shift ;;
+          *) break ;;
+        esac
+      done
+      ;;
+  esac
   case "$cmd" in
     restore|verify|status|doctor)
       [ $# -gt 0 ] && { err "unknown option for '$cmd': $1"; err "try: $NAME --guard-help"; exit 2; }
