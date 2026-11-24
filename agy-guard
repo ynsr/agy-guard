@@ -27,7 +27,12 @@
 #                                   proxy and record every domain it dials
 #                                     --log-file F   JSONL of each connection
 #                                     --summary F    JSON summary (default: <log>.summary.json)
-#                                     --upstream URL real proxy to forward to
+#   agy-guard start --endpoint URL --model ID [--api-key KEY] [--defaults]
+#                                   [-- cli args]
+#                                 one-shot session against a temporary
+#                                 OpenAI-compatible endpoint (gateway mode);
+#                                 exports AGY_LLM_GATEWAY_* for the child only,
+#                                 never touches settings.json
 #   agy-guard accounts <cmd> [opts] multi-account snapshots (see below)
 #                                     list [--json] · current [--json] ·
 #                                     add <name> · capture · use <name|next> [--force] ·
@@ -599,6 +604,88 @@ PY
   return "$child_rc"
 }
 
+# ---------------------------------------------------------------- start
+# One-shot session against a temporary OpenAI-compatible endpoint. Never
+# touches settings.json: gateway mode is env-driven, so the four
+# AGY_LLM_GATEWAY_* variables are exported for the child process only and die
+# with it. Runs the same fail-closed proxy gate as the launcher. Skips the
+# account assist/quota classifier: Google-account state must never be mutated
+# from custom-endpoint output. A settings.json with modelProvider set is a
+# usage error — gateway mode needs that key absent, and --settings cannot
+# unset a key.
+# Configurable defaults: AGY_GUARD_DEFAULT_ENDPOINT (default
+# http://localhost:7698/v1), AGY_GUARD_DEFAULT_MODEL (default
+# cline-pass/cline-pass/muse-spark-1.3-contributor).
+do_start() {
+  local endpoint="" model=""
+  local api_key="${AGY_LLM_GATEWAY_API_KEY:-}"
+  local endpoint_given=0 model_given=0 api_key_given=0 use_defaults=0
+  local -a cli_args=()
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --endpoint) [ $# -ge 2 ] || die_usage "start: --endpoint needs a URL"; endpoint="$2"; endpoint_given=1; shift 2 ;;
+      --endpoint=*) endpoint="${1#--endpoint=}"; endpoint_given=1; shift ;;
+      --model) [ $# -ge 2 ] || die_usage "start: --model needs a model id"; model="$2"; model_given=1; shift 2 ;;
+      --model=*) model="${1#--model=}"; model_given=1; shift ;;
+      --api-key) [ $# -ge 2 ] || die_usage "start: --api-key needs a key"; api_key="$2"; api_key_given=1; shift 2 ;;
+      --api-key=*) api_key="${1#--api-key=}"; api_key_given=1; shift ;;
+      --defaults) use_defaults=1; shift ;;
+      --quiet|-q) QUIET=1; shift ;;
+      --) shift; cli_args+=("$@"); break ;;
+      # anything else (positional or CLI flag) belongs to the CLI (-p,
+      # --sandbox, ...): forward it. A typo surfaces as the CLI's own error.
+      # `--` forces verbatim pass-through if the CLI ever gains our names.
+      *) cli_args+=("$1"); shift ;;
+    esac
+  done
+
+  if [ "$use_defaults" -eq 1 ]; then
+    [ "$endpoint_given" -eq 1 ] && die_usage "start: --defaults conflicts with --endpoint"
+    [ "$model_given" -eq 1 ] && die_usage "start: --defaults conflicts with --model"
+    endpoint="${AGY_GUARD_DEFAULT_ENDPOINT:-http://localhost:7698/v1}"
+    model="${AGY_GUARD_DEFAULT_MODEL:-cline-pass/cline-pass/muse-spark-1.3-contributor}"
+  fi
+  [ -n "$endpoint" ] || die_usage "start: --endpoint URL is required (or use --defaults)"
+  [ -n "$model" ] || die_usage "start: --model ID is required (or use --defaults)"
+  case "$endpoint" in
+    http://*|https://*) ;;
+    *) die_usage "start: --endpoint must be an http(s) URL, got: $endpoint" ;;
+  esac
+  # the gateway appends paths itself: strip one trailing /v1 (plus slashes)
+  # and any trailing slash so roots and /v1 forms converge
+  endpoint="${endpoint%/}"
+  case "$endpoint" in
+    */v1) endpoint="${endpoint%/v1}" ;;
+  esac
+
+  [ -x "$REAL" ] || { err "CLI binary not found or not executable: $REAL"; exit 1; }
+  if [ -f "${AGY_GUARD_GEMINI_DIR:-$HOME/.gemini}/antigravity-cli/settings.json" ] && \
+    grep -q '"modelProvider"' "${AGY_GUARD_GEMINI_DIR:-$HOME/.gemini}/antigravity-cli/settings.json" 2>/dev/null; then
+    err "start: settings.json sets modelProvider, which gateway mode does not use — remove it and retry"
+    err "start: (settings.json is never modified by 'start')"
+    exit 2
+  fi
+
+  assert_proxy_ok "$PROXY"
+
+  export HTTP_PROXY="$PROXY"  http_proxy="$PROXY"
+  export HTTPS_PROXY="$PROXY" https_proxy="$PROXY"
+  export ALL_PROXY="$PROXY"   all_proxy="$PROXY"
+  export NO_PROXY="$BYPASS"   no_proxy="$BYPASS"
+  export AGY_LLM_GATEWAY_URL="$endpoint"
+  export AGY_LLM_GATEWAY_WIRE_PROTOCOL="openai"
+  export AGY_LLM_GATEWAY_MODELS="$model"
+  if [ -n "$api_key" ] || [ "$api_key_given" -eq 1 ]; then
+    export AGY_LLM_GATEWAY_API_KEY="$api_key"
+  else
+    unset AGY_LLM_GATEWAY_API_KEY
+  fi
+
+  say "agy-guard: starting agy with temporary endpoint $endpoint (model: $model)"
+  exec "$REAL" --model "$model" "${cli_args[@]+"${cli_args[@]}"}"
+}
+
 # ---------------------------------------------------------------- dispatch
 if [ "$NAME" = "agy-guard" ]; then
   # peel options that may appear before the subcommand …
@@ -613,7 +700,7 @@ if [ "$NAME" = "agy-guard" ]; then
   done
   cmd="${1:-}"
   case "$cmd" in
-    restore|verify|status|doctor|trace|accounts|--guard-help|--gh|guard-help|--guard-version|--gv|guard-version|--)
+    restore|verify|status|doctor|trace|start|accounts|--guard-help|--gh|guard-help|--guard-version|--gv|guard-version|--)
       shift || true
       ;;
   esac
@@ -653,6 +740,7 @@ if [ "$NAME" = "agy-guard" ]; then
     verify|doctor) do_verify verify; exit $? ;;
     status) do_verify status; exit $? ;;
     trace) do_trace "$@"; exit $? ;;
+    start) do_start "$@"; exit $? ;;
     accounts) do_accounts "$@"; exit $? ;;
     --guard-help|--gh|guard-help) usage; exit 0 ;;
     --guard-version|--gv|guard-version) printf 'agy-guard %s\n' "$GUARD_VERSION"; exit 0 ;;

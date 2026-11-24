@@ -64,6 +64,7 @@ agy-guard -- restore        # force pass-through for a management name
 | `agy-guard status` | verify + real CLI binary path/size/version (version read through the launcher, never the raw binary) |
 | `agy-guard doctor` | alias of `verify` (`cli-hub doctor` contract) |
 | `agy-guard trace [opts] [-- cli args]` | run the CLI proxied through a **chained logging proxy** and record every domain it dials |
+| `agy-guard start --endpoint URL --model ID [--api-key KEY] [--defaults] [-- cli args]` | one-shot session against a temporary OpenAI-compatible endpoint (gateway mode); exports `AGY_LLM_GATEWAY_*` for the child only, never touches `settings.json` |
 | `agy-guard --guard-help` / `--gh` | guard help |
 | `agy-guard --guard-version` | guard version |
 | `agy-guard <args…>` | identical to `agy <args…>`: proxied, checked, forwarded |
@@ -91,8 +92,35 @@ pass-through if the CLI ever gains an `accounts` subcommand of its own.
  "checks":{"launcher":"ok","path":"ok","profiles":"ok"}}
 ```
 
-`status` is `ok`, `stale` (something needs repair) or `missing`; the exit code
 still carries the verdict.
+
+## Starting with a temporary custom endpoint
+
+`agy-guard start` runs one `agy` session against a temporary OpenAI-compatible
+endpoint and throws everything away when the session ends — `settings.json` is
+never touched. It uses the CLI's gateway mode (`AGY_LLM_GATEWAY_*`, exported
+for the child only) plus the session-only `--model` flag, and runs the same
+fail-closed proxy gate as the launcher first.
+
+```bash
+agy-guard start --endpoint http://localhost:11434/v1 --model llama3.1
+agy-guard start --defaults                       # endpoint http://localhost:7698/v1,
+                                                  # model cline-pass/cline-pass/muse-spark-1.3-contributor
+agy-guard start --endpoint URL --model ID -p "hi" # extra args go to the CLI
+```
+
+| option | meaning |
+|--------|---------|
+| `--endpoint URL` | custom endpoint root; one trailing `/v1` is stripped (the gateway appends paths itself). Required unless `--defaults` |
+| `--model ID` | model id sent verbatim to the gateway. Required unless `--defaults` |
+| `--api-key KEY` | gateway API key; overrides `AGY_LLM_GATEWAY_API_KEY`. Both optional — omit both for a keyless local gateway |
+| `--defaults` | use `AGY_GUARD_DEFAULT_ENDPOINT` / `AGY_GUARD_DEFAULT_MODEL` (or the bundled defaults); conflicts with `--endpoint`/`--model` |
+
+Rules: unknown flags (`-p`, `--sandbox`, …) are forwarded to the CLI untouched
+(`--` still forces verbatim pass-through); a `settings.json` with
+`modelProvider` set is refused with exit 2 (gateway mode needs that key
+absent); Google-account assist and quota classification are skipped — the
+session never mutates account state.
 
 ## Tracing what the CLI dials
 

@@ -36,8 +36,11 @@ setup() {
 printf 'ARGS: %s\n' "$*"
 printf 'HTTP_PROXY=%s\n' "${HTTP_PROXY:-}"
 printf 'HTTPS_PROXY=%s\n' "${HTTPS_PROXY:-}"
-printf 'ALL_PROXY=%s\n' "${ALL_PROXY:-}"
 printf 'NO_PROXY=%s\n' "${NO_PROXY:-}"
+printf 'GATEWAY_URL=%s\n' "${AGY_LLM_GATEWAY_URL:-}"
+printf 'GATEWAY_WIRE=%s\n' "${AGY_LLM_GATEWAY_WIRE_PROTOCOL:-}"
+printf 'GATEWAY_MODELS=%s\n' "${AGY_LLM_GATEWAY_MODELS:-}"
+printf 'GATEWAY_KEY=%s\n' "${AGY_LLM_GATEWAY_API_KEY:-}"
 # traffic for `trace`: one TLS (CONNECT) and one plain-http dial, both optional
 curl -s -o /dev/null --max-time 5 https://accounts.example.invalid/x 2>/dev/null || true
 curl -s -o /dev/null --max-time 5 http://plain.example.invalid/y 2>/dev/null || true
@@ -246,6 +249,80 @@ EOF
   [ "$status" -eq 0 ]
   [[ "$output" == *"would write"* ]]
   [ ! -e "$HOME/.local/bin/agy" ]
+}
+
+# ---------------------------------------------------------------- start
+@test "start forwards --model and strips /v1 from the gateway URL" {
+  run "$GUARD" start --endpoint http://localhost:11434/v1 --model llama3.1
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ARGS: --model llama3.1"* ]]
+  [[ "$output" == *"GATEWAY_URL=http://localhost:11434"* ]]
+  [[ "$output" == *"GATEWAY_WIRE=openai"* ]]
+  [[ "$output" == *"GATEWAY_MODELS=llama3.1"* ]]
+}
+
+@test "start passes a root endpoint verbatim and proxies the session" {
+  run "$GUARD" start --endpoint http://localhost:7698/ --model m -p "hi"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"GATEWAY_URL=http://localhost:7698"* ]]
+  [[ "$output" == *"ARGS: --model m -p hi"* ]]
+  [[ "$output" == *"HTTP_PROXY=http://127.0.0.1:$PROXY_PORT"* ]]
+}
+
+@test "start uses keyless env by default and honors --api-key" {
+  unset AGY_LLM_GATEWAY_API_KEY
+  run "$GUARD" start --endpoint http://localhost:11434 --model m
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"GATEWAY_KEY="* ]]
+  run "$GUARD" start --endpoint http://localhost:11434 --model m --api-key sekrit
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"GATEWAY_KEY=sekrit"* ]]
+}
+
+@test "start --defaults uses the bundled endpoint and model" {
+  run "$GUARD" start --defaults
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"GATEWAY_URL=http://localhost:7698"* ]]
+  [[ "$output" == *"cline-pass/cline-pass/muse-spark-1.3-contributor"* ]]
+  [[ "$output" == *"ARGS: --model cline-pass/cline-pass/muse-spark-1.3-contributor"* ]]
+}
+
+@test "start missing or invalid args are usage errors" {
+  run "$GUARD" start --model m
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"--endpoint"* ]]
+  run "$GUARD" start --endpoint http://x
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"--model"* ]]
+  run "$GUARD" start --endpoint socks5://x --model m
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"must be an http(s) URL"* ]]
+  run "$GUARD" start --bogus --model m --endpoint http://x
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ARGS: --model m --bogus"* ]]
+  run "$GUARD" start --defaults --endpoint http://x --model m
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"conflicts with"* ]]
+}
+
+@test "start refuses a dead proxy and refuses modelProvider settings" {
+  ANTIGRAVITY_PROXY="http://127.0.0.1:9" run "$GUARD" start --endpoint http://x --model m
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"is not reachable"* ]]
+  mkdir -p "$HOME/.gemini/antigravity-cli"
+  printf '{"modelProvider":"gemini","model":"x"}\n' >"$HOME/.gemini/antigravity-cli/settings.json"
+  run "$GUARD" start --endpoint http://x --model m
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"modelProvider"* ]]
+}
+
+@test "start passes extra CLI args through and -- start reaches the CLI" {
+  run "$GUARD" start --endpoint http://x/v1 --model m -- -p "hello"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ARGS: --model m -p hello"* ]]
+  run "$GUARD" -- start --endpoint http://x --model m
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ARGS: start --endpoint http://x --model m"* ]]
 }
 
 # ---------------------------------------------------------------- install.sh
