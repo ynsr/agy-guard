@@ -48,7 +48,7 @@ be executed directly (no proxy enforcement).
 |------|----------------|
 | `agy-guard` | launcher + management commands (single-file bash; deps: coreutils, curl, python3 — python3 runs the embedded `trace` proxy and rewrites one rc file) |
 | `install.sh` | copy/symlink into `~/.local/bin`, `--restore`, `--dry-run`, `--yes`, `--link`, `uninstall`, install receipt (`~/.local/share/agy-guard/install-receipt.json`), `cli-hub register/unregister` |
-| `tests/guard.bats` | 25 hermetic bats tests (stub CLI + stub proxy, no real network); the stub also dials two `.invalid` hosts through the logger to exercise `trace` |
+| `tests/guard.bats` | 33 hermetic bats tests (stub CLI + stub proxy, no real network); the stub also dials two `.invalid` hosts through the logger to exercise `trace` |
 | `tests/fake-proxy.py` | loopback proxy answering 204 to every request, used with `AGY_GUARD_PROBE_URL=http://…` |
 
 ## Build / test
