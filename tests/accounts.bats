@@ -380,3 +380,105 @@ PY
   [[ "$output" == *"a***@example.com"* ]]
   [[ "$output" != *"alice@example.com"* ]]
 }
+
+# ---------------------------------------------------------------- capture
+@test "capture with no registered accounts registers live login from email and sets active" {
+  keyring_setup
+  make_login shefvbrian20@gmail.com LIVE1
+  run "$GUARD" accounts capture
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"shefvbrian20"* ]]
+  run "$HELPER" current
+  [ "$status" -eq 0 ]
+  [ "$output" = "shefvbrian20" ]
+  run "$HELPER" list
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"* shefvbrian20"* ]]
+  [[ "$output" == *"s***@gmail.com"* ]]
+  run "$HELPER" verify
+  [ "$status" -eq 0 ]
+}
+
+@test "capture with explicit name registers new account and sets active" {
+  keyring_setup
+  make_login alice@example.com A1
+  run "$HELPER" capture work
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"'work'"* ]]
+  run "$HELPER" current
+  [ "$status" -eq 0 ]
+  [ "$output" = "work" ]
+  run "$HELPER" verify
+  [ "$status" -eq 0 ]
+}
+
+@test "capture re-snapshots active account when live login matches" {
+  keyring_setup
+  make_login a@example.com A1
+  run "$HELPER" add a
+  [ "$status" -eq 0 ]
+  # refresh live token for the same account
+  make_login a@example.com A2
+  run "$HELPER" capture
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"re-snapshotted the live login into 'a'"* ]]
+  # switch away and back to prove the updated A2 snapshot was stored
+  make_login b@example.com B1
+  run "$HELPER" add b
+  [ "$status" -eq 0 ]
+  run "$HELPER" --force use a
+  [ "$status" -eq 0 ]
+  grep -q '"tag":"A2"' "$AGY_GUARD_GEMINI_DIR/jetski-standalone-oauth-token"
+}
+
+@test "capture with different live login preserves prior active snapshot and matches or registers" {
+  keyring_setup
+  make_login a@example.com A1
+  run "$HELPER" add a
+  [ "$status" -eq 0 ]
+  # user logs into a second account b without running add
+  make_login b@example.com B1
+  run "$HELPER" capture
+  [ "$status" -eq 0 ]
+  run "$HELPER" current
+  [ "$status" -eq 0 ]
+  [ "$output" = "b" ]
+  # switching back to a must still restore A1 (not clobbered by B1)
+  run "$HELPER" --force use a
+  [ "$status" -eq 0 ]
+  grep -q '"tag":"A1"' "$AGY_GUARD_GEMINI_DIR/jetski-standalone-oauth-token"
+  # now swap live login back to b behind the guard's back and capture -> updates existing 'b'
+  make_login b@example.com B2
+  run "$HELPER" capture
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"re-snapshotted the live login into 'b'"* ]]
+  run "$HELPER" current
+  [ "$status" -eq 0 ]
+  [ "$output" = "b" ]
+}
+
+@test "capture explicit existing name refuses mismatched email without --force" {
+  keyring_setup
+  make_login a@example.com A1
+  run "$HELPER" add a
+  [ "$status" -eq 0 ]
+  make_login b@example.com B1
+  run "$HELPER" capture a
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"does not match"* ]]
+  run "$HELPER" --force capture a
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"re-snapshotted the live login into 'a'"* ]]
+}
+
+@test "capture --json emits structured output with redacted email" {
+  keyring_setup
+  make_login alice@example.com A1
+  run "$HELPER" capture --json
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'"name": "alice"'* ]]
+  [[ "$output" == *'"active": "alice"'* ]]
+  [[ "$output" == *'"action": "registered"'* ]]
+  [[ "$output" == *'"email": "a***@example.com"'* ]]
+  [[ "$output" != *"alice@example.com"* ]]
+}

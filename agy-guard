@@ -36,7 +36,7 @@
 #                                 never touches settings.json
 #   agy-guard accounts <cmd> [opts] multi-account snapshots (see below)
 #                                     list [--json] · current [--json] ·
-#                                     add <name> · capture · use <name|next> [--force] ·
+#                                     add <name> · capture [name] · use <name|next> [--force] ·
 #                                     mark <name> ok|exhausted|disabled [--until ISO8601] [--ack] ·
 #                                     remove <name> [--purge] [--dry-run] ·
 #                                     verify [--json] · backup --out FILE [--dry-run] ·
