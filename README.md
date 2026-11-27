@@ -71,7 +71,7 @@ agy-guard -- restore        # force pass-through for a management name
 | `agy-guard accounts list [--json]` | registered accounts, state, reset hints (`*` = active) |
 | `agy-guard accounts current [--json]` | active account name |
 | `agy-guard accounts add <name>` | register the CURRENT live login as `<name>` (snapshot only) |
-| `agy-guard accounts capture` | re-snapshot the live login into the active entry |
+| `agy-guard accounts capture [name]` | snapshot the live login into the active/matching entry (or register it if new) |
 | `agy-guard accounts use <name\|next> [--force]` | switch the live login (30-min dwell unless `--force`) |
 | `agy-guard accounts mark <name> ok\|exhausted\|disabled [--until ISO8601] [--ack]` | set state; `--ack` clears a rotation halt |
 | `agy-guard accounts remove <name> [--purge] [--dry-run]` | delete a snapshot (`--purge` also wipes live files) |
